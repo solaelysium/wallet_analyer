@@ -12,6 +12,18 @@ from .coingecko_client import CoingeckoClient
 from .database_helper import DB
 from .settings import CONFIGS, Logger
 
+# Chain configuration constants
+CHAIN_CONSTANTS = {
+    "ethereum": {
+        "MULTICALL3": "0xcA11bde05977b3631167028862bE2a173976CA11",
+        "UNISWAP_V3_FACTORY": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        "UNISWAP_V2_FACTORY": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+        "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    },
+    # Add other chains here
+}
+
 logger = Logger()
 
 # Global LIFO stack to limit concurrent external requests
@@ -76,7 +88,7 @@ class WebClient:
         self.chain_id: int = self.__get_chain_id()
 
         # * Documentation: https://github.com/pcko1/etherscan-python
-        #!!!! BUT I CHANGED ORIGINAL CODE IN `etherscan.py` FILE TO ADD MULTI-CHAIN SUPPORT
+        # ! BUT I CHANGED ORIGINAL CODE IN `etherscan.py` FILE TO ADD MULTI-CHAIN SUPPORT
         # Rotate Etherscan keys per client instance
         api_keys = CONFIGS.CRYPTO.ETHERSCAN_API_KEYS or []
         api_key = etherscan_api_key if etherscan_api_key is not None else (api_keys[0] if api_keys else "")
@@ -88,11 +100,17 @@ class WebClient:
         # In-memory caches
         self._token_meta_cache: dict[str, tuple[str, int]] = {}
 
-        # Uniswap factories and common tokens (Ethereum mainnet)
-        self.UNISWAP_V3_FACTORY = self.w3.to_checksum_address("0x1F98431c8aD98523631AE4a59f267346ea31F984")
-        self.UNISWAP_V2_FACTORY = self.w3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-        self.WETH = self.w3.to_checksum_address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
-        self.USDC = self.w3.to_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+        # Load Chain Constants
+        config = CHAIN_CONSTANTS.get(self.NETWORK.lower())
+        if not config:
+            logger.warning(f"Network {self.NETWORK} not found in CHAIN_CONSTANTS. Using Ethereum defaults.")
+            config = CHAIN_CONSTANTS["ethereum"]
+
+        self.UNISWAP_V3_FACTORY = self.w3.to_checksum_address(config["UNISWAP_V3_FACTORY"])
+        self.UNISWAP_V2_FACTORY = self.w3.to_checksum_address(config["UNISWAP_V2_FACTORY"])
+        self.WETH = self.w3.to_checksum_address(config["WETH"])
+        self.USDC = self.w3.to_checksum_address(config["USDC"])
+        self.MULTICALL_ADDR = self.w3.to_checksum_address(config["MULTICALL3"])
         self.UNI_V3_FEE_TIERS = [500, 3000, 10000]
 
     def _throttle(self):
@@ -574,210 +592,227 @@ class WebClient:
             logger.error(f"Error getting transaction receipt: {e}")
             raise Exception(f"Error getting transaction receipt: {e}")
 
+    def _multicall(self, calls: list[tuple[str, str]], block_identifier: int | str = "latest") -> list[bytes]:
+        """
+        Execute Multicall3 aggregate call.
+        Args:
+            calls: list of (target_address, calldata_bytes)
+            block_identifier: block number
+        Returns:
+            list of raw bytes results. If a call fails, returns b'' for that item.
+        """
+        multicall_abi = [
+            {
+                "inputs": [{"components": [{"name": "target", "type": "address"}, {"name": "callData", "type": "bytes"}], "name": "calls", "type": "tuple[]"}],
+                "name": "aggregate",
+                "outputs": [{"name": "blockNumber", "type": "uint256"}, {"name": "returnData", "type": "bytes[]"}],
+                "stateMutability": "view",
+                "type": "function",
+            }
+        ]
+        
+        # Prepare inputs for aggregate((address, bytes)[])
+        formatted_calls = [{"target": target, "callData": data} for target, data in calls]
+        
+        try:
+            contract = self.w3.eth.contract(address=self.MULTICALL_ADDR, abi=multicall_abi)
+            _, return_data = contract.functions.aggregate(formatted_calls).call(block_identifier=block_identifier)
+            return return_data
+        except Exception as e:
+            logger.error(f"Multicall failed: {e}")
+            return [b""] * len(calls)
+
     def get_token_price_usd_at_block(self, token_address: str, block_number: int) -> float | None:
         """
-        Spot price via Uniswap V3/V2 composed routes at a given block.
+        Spot price via Uniswap V3/V2 using Multicall for efficiency.
         Strategy:
-          1) V3: token<->WETH pool across common fee tiers; compose with WETH<->USDC V3
-          2) V2: token<->WETH, then WETH<->USDC
-          3) V2: token<->USDC direct
-        Returns float price in USD or None if not found/illiquid.
+          1. Batch 1: Get all potential pool addresses (V3 tiers, V2 pairs).
+          2. Batch 2: Get metadata (slot0, reserves) for found pools.
+          3. Calculate price locally.
         """
         try:
             token = self.w3.to_checksum_address(token_address)
         except Exception:
             return None
 
-        # minimal ABIs
-        v3_factory_abi = [
-            {
-                "inputs": [
-                    {"internalType": "address", "name": "tokenA", "type": "address"},
-                    {"internalType": "address", "name": "tokenB", "type": "address"},
-                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
-                ],
-                "name": "getPool",
-                "outputs": [{"internalType": "address", "name": "pool", "type": "address"}],
-                "stateMutability": "view",
-                "type": "function",
-            }
-        ]
-        v2_factory_abi = [
-            {
-                "inputs": [
-                    {"internalType": "address", "name": "tokenA", "type": "address"},
-                    {"internalType": "address", "name": "tokenB", "type": "address"},
-                ],
-                "name": "getPair",
-                "outputs": [{"internalType": "address", "name": "pair", "type": "address"}],
-                "stateMutability": "view",
-                "type": "function",
-            }
-        ]
-        v3_pool_abi = [
-            {
-                "name": "slot0",
-                "outputs": [
-                    {"type": "uint160", "name": "sqrtPriceX96"},
-                    {"type": "int24", "name": "tick"},
-                    {"type": "uint16", "name": "observationIndex"},
-                    {"type": "uint16", "name": "observationCardinality"},
-                    {"type": "uint16", "name": "observationCardinalityNext"},
-                    {"type": "uint8", "name": "feeProtocol"},
-                    {"type": "bool", "name": "unlocked"},
-                ],
-                "stateMutability": "view",
-                "type": "function",
-            },
-            {"name": "token0", "outputs": [{"type": "address", "name": ""}], "stateMutability": "view", "type": "function"},
-            {"name": "token1", "outputs": [{"type": "address", "name": ""}], "stateMutability": "view", "type": "function"},
-            {"name": "liquidity", "outputs": [{"type": "uint128", "name": ""}], "stateMutability": "view", "type": "function"},
-        ]
-        v2_pair_abi = [
-            {
-                "name": "getReserves",
-                "outputs": [
-                    {"type": "uint112", "name": "_reserve0"},
-                    {"type": "uint112", "name": "_reserve1"},
-                    {"type": "uint32", "name": "_blockTimestampLast"},
-                ],
-                "stateMutability": "view",
-                "type": "function",
-            },
-            {"name": "token0", "outputs": [{"type": "address", "name": ""}], "stateMutability": "view", "type": "function"},
-            {"name": "token1", "outputs": [{"type": "address", "name": ""}], "stateMutability": "view", "type": "function"},
-        ]
+        # ABIs definitions
+        v3_factory_abi = [{"inputs": [{"type": "address", "name": "tA"}, {"type": "address", "name": "tB"}, {"type": "uint24", "name": "fee"}], "name": "getPool", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+        v2_factory_abi = [{"inputs": [{"type": "address", "name": "tA"}, {"type": "address", "name": "tB"}], "name": "getPair", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+        v3_pool_abi = [{"inputs": [], "name": "slot0", "outputs": [{"type": "uint160", "name": "sqrtPriceX96"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint8"}, {"type": "bool"}], "type": "function"}, {"inputs": [], "name": "liquidity", "outputs": [{"type": "uint128", "name": ""}], "type": "function"}, {"inputs": [], "name": "token0", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+        v2_pair_abi = [{"inputs": [], "name": "getReserves", "outputs": [{"type": "uint112", "name": "r0"}, {"type": "uint112", "name": "r1"}, {"type": "uint32", "name": "ts"}], "type": "function"}, {"inputs": [], "name": "token0", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
 
-        def sqrtprice_to_price(sqrtX96: int) -> Decimal:
-            s = Decimal(int(sqrtX96))
-            denom = Decimal(2) ** 96
-            return (s / denom) ** 2
+        # Contracts
+        v3_fact = self.w3.eth.contract(address=self.UNISWAP_V3_FACTORY, abi=v3_factory_abi)
+        v2_fact = self.w3.eth.contract(address=self.UNISWAP_V2_FACTORY, abi=v2_factory_abi)
 
-        def decimals_at(addr: str) -> int:
-            try:
-                # reuse meta cache/db
-                _, dec = self.get_token_meta(addr)
-                return int(dec)
-            except Exception:
-                return 18
+        # --- BATCH 1: Discovery (Get Pool Addresses) ---
+        # Map: request_id -> (type, tokenA, tokenB, extra)
+        discovery_map = []
+        calls_batch_1 = []
 
-        # 1) V3 token<->WETH
-        v3_factory = self.w3.eth.contract(address=self.UNISWAP_V3_FACTORY, abi=v3_factory_abi)
+        # Helper to add call
+        def add_discovery(contract, func_name, args, meta):
+            data = contract.encodeABI(fn_name=func_name, args=args)
+            calls_batch_1.append((contract.address, data))
+            discovery_map.append(meta)
+
+        # V3 Token-WETH
         for fee in self.UNI_V3_FEE_TIERS:
-            try:
-                pool = v3_factory.functions.getPool(token, self.WETH, fee).call(block_identifier=block_number)
-            except Exception:
-                pool = None
-            if not pool or int(pool, 16) == 0:
-                continue
-            try:
-                pool_c = self.w3.eth.contract(address=pool, abi=v3_pool_abi)
-                slot0 = pool_c.functions.slot0().call(block_identifier=block_number)
-                liquidity = pool_c.functions.liquidity().call(block_identifier=block_number)
-                if int(liquidity) == 0:
-                    continue
-                t0 = pool_c.functions.token0().call(block_identifier=block_number)
-                t1 = pool_c.functions.token1().call(block_identifier=block_number)
-                price_raw = sqrtprice_to_price(slot0[0])  # token1 per token0
-                d0 = decimals_at(t0)
-                d1 = decimals_at(t1)
-                price_adj = price_raw * (Decimal(10) ** (d0 - d1))
-                if token.lower() == t0.lower():
-                    token_in_weth = price_adj
-                else:
-                    token_in_weth = Decimal(1) / price_adj
+            add_discovery(v3_fact, "getPool", [token, self.WETH, fee], {"type": "v3", "pair": "T-W", "fee": fee})
+        # V3 WETH-USDC
+        for fee in self.UNI_V3_FEE_TIERS:
+            add_discovery(v3_fact, "getPool", [self.WETH, self.USDC, fee], {"type": "v3", "pair": "W-U", "fee": fee})
+        # V2 Token-WETH
+        add_discovery(v2_fact, "getPair", [token, self.WETH], {"type": "v2", "pair": "T-W"})
+        # V2 WETH-USDC
+        add_discovery(v2_fact, "getPair", [self.WETH, self.USDC], {"type": "v2", "pair": "W-U"})
+        # V2 Token-USDC (Direct)
+        add_discovery(v2_fact, "getPair", [token, self.USDC], {"type": "v2", "pair": "T-U"})
 
-                # WETH -> USDC via V3
-                weth_usd = None
-                for f2 in self.UNI_V3_FEE_TIERS:
-                    try:
-                        pool2 = v3_factory.functions.getPool(self.WETH, self.USDC, f2).call(block_identifier=block_number)
-                    except Exception:
-                        pool2 = None
-                    if not pool2 or int(pool2, 16) == 0:
-                        continue
-                    pc2 = self.w3.eth.contract(address=pool2, abi=v3_pool_abi)
-                    slot2 = pc2.functions.slot0().call(block_identifier=block_number)
-                    liq2 = pc2.functions.liquidity().call(block_identifier=block_number)
-                    if int(liq2) == 0:
-                        continue
-                    pr2 = sqrtprice_to_price(slot2[0])
-                    dd0 = decimals_at(pc2.functions.token0().call(block_identifier=block_number))
-                    dd1 = decimals_at(pc2.functions.token1().call(block_identifier=block_number))
-                    pr2_adj = pr2 * (Decimal(10) ** (dd0 - dd1))
-                    # if token0 is WETH, price is token1 per token0 => USDC per WETH
-                    t0_2 = pc2.functions.token0().call(block_identifier=block_number)
-                    if self.WETH.lower() == t0_2.lower():
-                        weth_usd = pr2_adj
-                    else:
-                        weth_usd = Decimal(1) / pr2_adj
-                    if weth_usd and weth_usd > 0:
-                        break
-                if weth_usd and weth_usd > 0:
-                    return float((token_in_weth * weth_usd))
-            except Exception:
-                continue
+        # EXECUTE BATCH 1
+        results_1 = self._multicall(calls_batch_1, block_number)
+        
+        # --- BATCH 2: Data Fetching (Slot0/Reserves) ---
+        valid_pools = {} # key -> address
+        calls_batch_2 = []
+        data_map = [] # index -> (pool_key, data_type)
 
-        # 2) V2 token<->WETH then WETH<->USDC
-        v2_factory = self.w3.eth.contract(address=self.UNISWAP_V2_FACTORY, abi=v2_factory_abi)
-        try:
-            pair_tw = v2_factory.functions.getPair(token, self.WETH).call(block_identifier=block_number)
-        except Exception:
-            pair_tw = None
-        if pair_tw and int(pair_tw, 16) != 0:
+        def add_data_call(addr, abi, method, pool_key, data_type):
+            tmp_c = self.w3.eth.contract(address=addr, abi=abi)
+            calls_batch_2.append((addr, tmp_c.encodeABI(fn_name=method)))
+            data_map.append({"key": pool_key, "type": data_type})
+
+        # Process addresses
+        for i, res in enumerate(results_1):
+            if not res or len(res) < 20: continue # Invalid
+            addr = self.w3.to_checksum_address(self.w3.eth.codec.decode(["address"], res)[0])
+            if int(addr, 16) == 0: continue
+            
+            meta = discovery_map[i]
+            # Create a unique key for this pool choice, e.g. "v3_T-W_3000"
+            pkey = f"{meta['type']}_{meta['pair']}" + (f"_{meta['fee']}" if 'fee' in meta else "")
+            valid_pools[pkey] = addr
+
+            if meta["type"] == "v3":
+                add_data_call(addr, v3_pool_abi, "slot0", pkey, "slot0")
+                add_data_call(addr, v3_pool_abi, "liquidity", pkey, "liquidity")
+                add_data_call(addr, v3_pool_abi, "token0", pkey, "token0")
+            else: # v2
+                add_data_call(addr, v2_pair_abi, "getReserves", pkey, "reserves")
+                add_data_call(addr, v2_pair_abi, "token0", pkey, "token0")
+
+        if not calls_batch_2:
+            return None
+
+        # EXECUTE BATCH 2
+        results_2 = self._multicall(calls_batch_2, block_number)
+
+        # Parse Data
+        pool_data = {} # pkey -> {slot0: ..., token0: ...}
+
+        for i, res in enumerate(results_2):
+            if not res: continue
+            meta = data_map[i]
+            pkey = meta["key"]
+            if pkey not in pool_data: pool_data[pkey] = {}
+            
             try:
-                pair_abi_c = self.w3.eth.contract(address=pair_tw, abi=v2_pair_abi)
-                r0, r1, _ = pair_abi_c.functions.getReserves().call(block_identifier=block_number)
-                t0 = pair_abi_c.functions.token0().call(block_identifier=block_number)
-                t1 = pair_abi_c.functions.token1().call(block_identifier=block_number)
-                if int(r0) + int(r1) > 0:
-                    dec0 = decimals_at(t0)
-                    dec1 = decimals_at(t1)
-                    R0 = Decimal(r0) / (Decimal(10) ** dec0)
-                    R1 = Decimal(r1) / (Decimal(10) ** dec1)
-                    if token.lower() == t0.lower():
-                        price_in_weth = R1 / R0
-                    else:
-                        price_in_weth = R0 / R1
-
-                    pair_wu = v2_factory.functions.getPair(self.WETH, self.USDC).call(block_identifier=block_number)
-                    if pair_wu and int(pair_wu, 16) != 0:
-                        pwu = self.w3.eth.contract(address=pair_wu, abi=v2_pair_abi)
-                        rr0, rr1, _ = pwu.functions.getReserves().call(block_identifier=block_number)
-                        tt0 = pwu.functions.token0().call(block_identifier=block_number)
-                        tt1 = pwu.functions.token1().call(block_identifier=block_number)
-                        if int(rr0) + int(rr1) > 0:
-                            d0 = decimals_at(tt0)
-                            d1 = decimals_at(tt1)
-                            RR0 = Decimal(rr0) / (Decimal(10) ** d0)
-                            RR1 = Decimal(rr1) / (Decimal(10) ** d1)
-                            weth_usd = RR1 / RR0 if tt0.lower() == self.WETH.lower() else RR0 / RR1
-                            if weth_usd and weth_usd > 0:
-                                return float((price_in_weth * weth_usd))
+                if meta["type"] == "slot0":
+                    # (sqrtPriceX96, tick, ...)
+                    decoded = self.w3.eth.codec.decode(["uint160", "int24", "uint16", "uint16", "uint16", "uint8", "bool"], res)
+                    pool_data[pkey]["sqrtPriceX96"] = decoded[0]
+                elif meta["type"] == "liquidity":
+                    pool_data[pkey]["liquidity"] = self.w3.eth.codec.decode(["uint128"], res)[0]
+                elif meta["type"] == "reserves":
+                    decoded = self.w3.eth.codec.decode(["uint112", "uint112", "uint32"], res)
+                    pool_data[pkey]["reserves"] = (decoded[0], decoded[1])
+                elif meta["type"] == "token0":
+                    pool_data[pkey]["token0"] = self.w3.to_checksum_address(self.w3.eth.codec.decode(["address"], res)[0])
             except Exception:
                 pass
 
-        # 3) V2 token<->USDC
-        try:
-            pair_tu = v2_factory.functions.getPair(token, self.USDC).call(block_identifier=block_number)
-        except Exception:
-            pair_tu = None
-        if pair_tu and int(pair_tu, 16) != 0:
+        # Helpers for Calc
+        def get_dec(addr):
             try:
-                ptu = self.w3.eth.contract(address=pair_tu, abi=v2_pair_abi)
-                r0, r1, _ = ptu.functions.getReserves().call(block_identifier=block_number)
-                t0 = ptu.functions.token0().call(block_identifier=block_number)
-                t1 = ptu.functions.token1().call(block_identifier=block_number)
-                if int(r0) + int(r1) > 0:
-                    d0 = decimals_at(t0)
-                    d1 = decimals_at(t1)
-                    R0 = Decimal(r0) / (Decimal(10) ** d0)
-                    R1 = Decimal(r1) / (Decimal(10) ** d1)
-                    price_usd = R1 / R0 if t0.lower() == token.lower() else R0 / R1
-                    return float(price_usd)
-            except Exception:
-                pass
+                # Assuming decimals are cached/fast enough or we could have multicalled them too. 
+                # For now using existing method to keep scope sane.
+                _, d = self.get_token_meta(addr) 
+                return int(d)
+            except: return 18
+
+        def sqrt_to_price(sqrt, d0, d1):
+            s = Decimal(sqrt)
+            return ((s / Decimal(2)**96) ** 2) * (Decimal(10) ** (d0 - d1))
+
+        # --- CALCULATION LOGIC ---
+        
+        # 1. Try V3 Token->WETH
+        best_price_weth = None
+        # Check all fee tiers
+        for fee in self.UNI_V3_FEE_TIERS:
+            k = f"v3_T-W_{fee}"
+            d = pool_data.get(k)
+            if d and d.get("liquidity", 0) > 0 and "sqrtPriceX96" in d:
+                t0_addr = d.get("token0")
+                p = sqrt_to_price(d["sqrtPriceX96"], get_dec(token), 18) if t0_addr == token else Decimal(1)/sqrt_to_price(d["sqrtPriceX96"], 18, get_dec(token))
+                best_price_weth = p
+                break
+        
+        # If not found V3, try V2 Token->WETH
+        if not best_price_weth:
+            d = pool_data.get("v2_T-W")
+            if d and "reserves" in d:
+                r0, r1 = d["reserves"]
+                if r0 > 0 and r1 > 0:
+                    t0_addr = d.get("token0")
+                    dec_t = get_dec(token)
+                    # if t0 is token, price = r1(weth)/r0(token)
+                    R0 = Decimal(r0) / Decimal(10)**(dec_t if t0_addr == token else 18)
+                    R1 = Decimal(r1) / Decimal(10)**(18 if t0_addr == token else dec_t)
+                    best_price_weth = R1/R0 if t0_addr == token else R0/R1
+
+        # Calculate WETH->USDC Price
+        weth_usd_price = None
+        # Try V3 WETH->USDC
+        for fee in self.UNI_V3_FEE_TIERS:
+            k = f"v3_W-U_{fee}"
+            d = pool_data.get(k)
+            if d and d.get("liquidity", 0) > 0:
+                t0_addr = d.get("token0")
+                # WETH(18) -> USDC(6)
+                # if t0 is WETH: price is USDC/WETH
+                d0, d1 = (18, 6) if t0_addr == self.WETH else (6, 18)
+                raw = sqrt_to_price(d["sqrtPriceX96"], d0, d1)
+                weth_usd_price = raw if t0_addr == self.WETH else Decimal(1)/raw
+                break
+        
+        # Try V2 WETH->USDC if needed
+        if not weth_usd_price:
+            d = pool_data.get("v2_W-U")
+            if d and "reserves" in d:
+                r0, r1 = d["reserves"]
+                if r0 > 0 and r1 > 0:
+                    t0_addr = d.get("token0")
+                    d0, d1 = (18, 6) if t0_addr == self.WETH else (6, 18)
+                    R0 = Decimal(r0) / Decimal(10)**d0
+                    R1 = Decimal(r1) / Decimal(10)**d1
+                    weth_usd_price = R1/R0 if t0_addr == self.WETH else R0/R1
+
+        # Final Calc
+        if best_price_weth and weth_usd_price:
+            return float(best_price_weth * weth_usd_price)
+
+        # 3. Direct V2 Token->USDC fallback
+        d = pool_data.get("v2_T-U")
+        if d and "reserves" in d:
+             r0, r1 = d["reserves"]
+             if r0 > 0 and r1 > 0:
+                t0_addr = d.get("token0")
+                dec_t = get_dec(token)
+                d0, d1 = (dec_t, 6) if t0_addr == token else (6, dec_t)
+                R0 = Decimal(r0) / Decimal(10)**d0
+                R1 = Decimal(r1) / Decimal(10)**d1
+                p = R1/R0 if t0_addr == token else R0/R1
+                return float(p)
 
         return None
-
-    # Removed Uniswap spot fallback method
