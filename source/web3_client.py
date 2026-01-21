@@ -334,7 +334,7 @@ class WebClient:
             raise ValueError('Given address is empty')
         try:
             code = self.w3.eth.get_code(address).hex()
-            return len(code) < 46
+            return len(code) <= 46
         except Exception as e:
             logger.error(f"Error getting code for address {address}: {e}")
             return None
