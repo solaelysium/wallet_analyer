@@ -653,6 +653,7 @@ class WebClient:
                 token = self.w3.to_checksum_address(token_address)
         except Exception:
             return None
+        token_lower = token.lower()
 
         # Contracts
         v3_fact = self.w3.eth.contract(address=self.UNISWAP_V3_FACTORY, abi=v3_factory_abi)
@@ -709,10 +710,8 @@ class WebClient:
             if meta["type"] == "v3":
                 add_data_call(addr, v3_pool_abi, "slot0", pkey, "slot0")
                 add_data_call(addr, v3_pool_abi, "liquidity", pkey, "liquidity")
-                add_data_call(addr, v3_pool_abi, "token0", pkey, "token0")
             else: # v2
                 add_data_call(addr, v2_pair_abi, "getReserves", pkey, "reserves")
-                add_data_call(addr, v2_pair_abi, "token0", pkey, "token0")
 
         if not calls_batch_2:
             return None
@@ -739,19 +738,20 @@ class WebClient:
                 elif meta["type"] == "reserves":
                     decoded = self.w3.eth.codec.decode(["uint112", "uint112", "uint32"], res)
                     pool_data[pkey]["reserves"] = (decoded[0], decoded[1])
-                elif meta["type"] == "token0":
-                    pool_data[pkey]["token0"] = self.w3.to_checksum_address(self.w3.eth.codec.decode(["address"], res)[0])
             except Exception:
                 pass
 
         # Helpers for Calc
         def get_dec(addr):
             try:
-                # Assuming decimals are cached/fast enough or we could have multicalled them too. 
+                # Assuming decimals are cached/fast enough or we could have multicalled them too.
                 # For now using existing method to keep scope sane.
-                _, d = self.get_token_meta(addr) 
+                _, d = self.get_token_meta(addr)
                 return int(d)
-            except: return 18
+            except:
+                return 18
+
+        dec_token = get_dec(token)
 
         def sqrt_to_price(sqrt, d0, d1):
             s = Decimal(sqrt)
@@ -766,8 +766,11 @@ class WebClient:
             k = f"v3_T-W_{fee}"
             d = pool_data.get(k)
             if d and d.get("liquidity", 0) > 0 and "sqrtPriceX96" in d:
-                t0_addr = d.get("token0")
-                p = sqrt_to_price(d["sqrtPriceX96"], get_dec(token), 18) if t0_addr == token else Decimal(1)/sqrt_to_price(d["sqrtPriceX96"], 18, get_dec(token))
+                t0_is_token = token_lower < self.WETH.lower()
+                if t0_is_token:
+                    p = sqrt_to_price(d["sqrtPriceX96"], dec_token, 18)
+                else:
+                    p = Decimal(1) / sqrt_to_price(d["sqrtPriceX96"], 18, dec_token)
                 best_price_weth = p
                 break
         
@@ -777,12 +780,10 @@ class WebClient:
             if d and "reserves" in d:
                 r0, r1 = d["reserves"]
                 if r0 > 0 and r1 > 0:
-                    t0_addr = d.get("token0")
-                    dec_t = get_dec(token)
-                    # if t0 is token, price = r1(weth)/r0(token)
-                    R0 = Decimal(r0) / Decimal(10)**(dec_t if t0_addr == token else 18)
-                    R1 = Decimal(r1) / Decimal(10)**(18 if t0_addr == token else dec_t)
-                    best_price_weth = R1/R0 if t0_addr == token else R0/R1
+                    t0_is_token = token_lower < self.WETH.lower()
+                    R0 = Decimal(r0) / Decimal(10)**(dec_token if t0_is_token else 18)
+                    R1 = Decimal(r1) / Decimal(10)**(18 if t0_is_token else dec_token)
+                    best_price_weth = R1/R0 if t0_is_token else R0/R1
 
         # Calculate WETH->USDC Price
         weth_usd_price = None
@@ -791,12 +792,10 @@ class WebClient:
             k = f"v3_W-U_{fee}"
             d = pool_data.get(k)
             if d and d.get("liquidity", 0) > 0:
-                t0_addr = d.get("token0")
-                # WETH(18) -> USDC(6)
-                # if t0 is WETH: price is USDC/WETH
-                d0, d1 = (18, 6) if t0_addr == self.WETH else (6, 18)
+                t0_is_weth = self.WETH.lower() < self.USDC.lower()
+                d0, d1 = (18, 6) if t0_is_weth else (6, 18)
                 raw = sqrt_to_price(d["sqrtPriceX96"], d0, d1)
-                weth_usd_price = raw if t0_addr == self.WETH else Decimal(1)/raw
+                weth_usd_price = raw if t0_is_weth else Decimal(1) / raw
                 break
         
         # Try V2 WETH->USDC if needed
@@ -805,11 +804,11 @@ class WebClient:
             if d and "reserves" in d:
                 r0, r1 = d["reserves"]
                 if r0 > 0 and r1 > 0:
-                    t0_addr = d.get("token0")
-                    d0, d1 = (18, 6) if t0_addr == self.WETH else (6, 18)
+                    t0_is_weth = self.WETH.lower() < self.USDC.lower()
+                    d0, d1 = (18, 6) if t0_is_weth else (6, 18)
                     R0 = Decimal(r0) / Decimal(10)**d0
                     R1 = Decimal(r1) / Decimal(10)**d1
-                    weth_usd_price = R1/R0 if t0_addr == self.WETH else R0/R1
+                    weth_usd_price = R1/R0 if t0_is_weth else R0/R1
 
         # Final Calc
         if token.lower() == self.WETH.lower():
@@ -821,14 +820,13 @@ class WebClient:
         # 3. Direct V2 Token->USDC fallback
         d = pool_data.get("v2_T-U")
         if d and "reserves" in d:
-             r0, r1 = d["reserves"]
-             if r0 > 0 and r1 > 0:
-                t0_addr = d.get("token0")
-                dec_t = get_dec(token)
-                d0, d1 = (dec_t, 6) if t0_addr == token else (6, dec_t)
+            r0, r1 = d["reserves"]
+            if r0 > 0 and r1 > 0:
+                t0_is_token = token_lower < self.USDC.lower()
+                d0, d1 = (dec_token, 6) if t0_is_token else (6, dec_token)
                 R0 = Decimal(r0) / Decimal(10)**d0
                 R1 = Decimal(r1) / Decimal(10)**d1
-                p = R1/R0 if t0_addr == token else R0/R1
+                p = R1/R0 if t0_is_token else R0/R1
                 return float(p)
 
         return None
