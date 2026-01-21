@@ -1,11 +1,12 @@
-from .configurations import CONFIGS, CoingeckoConfig, CryptoConfig, GlobalConfig
+from .configurations import CONFIGS, configCoingecko, configCrypto, configGlobal, configUniswapABI
 from .logger import Logger, set_log_prefix
 
 __all__ = [
     "CONFIGS",
     "Logger",
-    "CryptoConfig",
-    "CoingeckoConfig",
-    "GlobalConfig",
+    "configCrypto",
+    "configCoingecko",
+    "configGlobal",
+    "configUniswapABI",
     "set_log_prefix",
 ]

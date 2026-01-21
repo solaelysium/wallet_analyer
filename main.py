@@ -119,7 +119,7 @@ def worker_process_addresses(addresses: list[str], t_idx: int, w_idx: int, web_c
             stage = "init"
             try:
                 # * Checking for contract
-                is_wallet = web_client.get_is_wallet(address)
+                is_wallet = web_client.is_wallet(address)
 
                 if is_wallet is None:
                     logger.error(f"Error getting is_wallet for address {address}")
@@ -192,7 +192,7 @@ def key_thread_runner(t_idx: int, addresses: list[str], rpc_url: str, etherscan_
     logger.info(f"Starting key thread | RPC: {rpc_url}")
 
     # One client per key thread
-    web_client = WebClient(rpc_url, NETWORK, None, etherscan_api_key=etherscan_key)
+    web_client = WebClient(rpc_url, NETWORK, ETHERSCAN_API_KEY=etherscan_key)
 
     # Split addresses for workers
     worker_chunks = split_into_chunks(addresses, max(1, workers_per_key))

@@ -1,0 +1,13 @@
+web3
+etherscan-python
+python-dotenv
+requests
+numpy
+pandas
+scikit-learn
+umap-learn
+hdbscan
+joblib
+matplotlib
+ipykernel
+

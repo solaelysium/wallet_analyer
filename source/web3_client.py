@@ -24,6 +24,18 @@ CHAIN_CONSTANTS = {
     # Add other chains here
 }
 
+# ABIs 
+# # This is older version
+# v3_factory_abi = [{"inputs": [{"type": "address", "name": "tA"}, {"type": "address", "name": "tB"}, {"type": "uint24", "name": "fee"}], "name": "getPool", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+# v2_factory_abi = [{"inputs": [{"type": "address", "name": "tA"}, {"type": "address", "name": "tB"}], "name": "getPair", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+# v3_pool_abi = [{"inputs": [], "name": "slot0", "outputs": [{"type": "uint160", "name": "sqrtPriceX96"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint8"}, {"type": "bool"}], "type": "function"}, {"inputs": [], "name": "liquidity", "outputs": [{"type": "uint128", "name": ""}], "type": "function"}, {"inputs": [], "name": "token0", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+# v2_pair_abi = [{"inputs": [], "name": "getReserves", "outputs": [{"type": "uint112", "name": "r0"}, {"type": "uint112", "name": "r1"}, {"type": "uint32", "name": "ts"}], "type": "function"}, {"inputs": [], "name": "token0", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
+
+v3_factory_abi = CONFIGS.UNISWAP_ABI.V3_FACTORY_ABI
+v2_factory_abi = CONFIGS.UNISWAP_ABI.V2_FACTORY_ABI
+v3_pool_abi = CONFIGS.UNISWAP_ABI.V3_POOL_ABI
+v2_pair_abi = CONFIGS.UNISWAP_ABI.V2_PAIR_ABI
+
 logger = Logger()
 
 # Global LIFO stack to limit concurrent external requests
@@ -67,7 +79,7 @@ def _ensure_request_workers():
 
 
 class WebClient:
-    def __init__(self, RPC_URL: str, NETWORK: str, COVALENT_API_KEY: str, etherscan_api_key: str | None = None) -> None:
+    def __init__(self, RPC_URL: str, NETWORK: str, ETHERSCAN_API_KEY: str | None = None) -> None:
         """
         Initialize Web3Client with RPC URL
 
@@ -91,7 +103,7 @@ class WebClient:
         # ! BUT I CHANGED ORIGINAL CODE IN `etherscan.py` FILE TO ADD MULTI-CHAIN SUPPORT
         # Rotate Etherscan keys per client instance
         api_keys = CONFIGS.CRYPTO.ETHERSCAN_API_KEYS or []
-        api_key = etherscan_api_key if etherscan_api_key is not None else (api_keys[0] if api_keys else "")
+        api_key = ETHERSCAN_API_KEY if ETHERSCAN_API_KEY is not None else (api_keys[0] if api_keys else "")
         self.etherscan_client: Etherscan = Etherscan(api_key=api_key, use_v2=True, chain_id=self.chain_id)
 
         # * Documentation: https://docs.coingecko.com/v3.0.1/reference/introduction
@@ -307,22 +319,25 @@ class WebClient:
         self._token_meta_cache[addr_checksum] = (sym, dec)
         return self._token_meta_cache[addr_checksum]
 
-    def get_is_wallet(self, address: str) -> bool:
+    def is_wallet(self, address: str) -> bool | None:
         """
-        Get if the address is a wallet
+        Check if address is wallet or not
 
         Args:
-        - `address (str)`: Address of the account
+        - `address (str)`: Given address
 
         Returns:
-        - `bool`: True if the address is a wallet, False otherwise
+            `bool`: True for the wallet, False for the contract
         """
+        if not address:
+            logger.error('Given address is empty')
+            raise ValueError('Given address is empty')
         try:
-            code = self.w3.eth.get_code(self.w3.to_checksum_address(address))
+            code = self.w3.eth.get_code(address).hex()
+            return len(code) < 46
         except Exception as e:
             logger.error(f"Error getting code for address {address}: {e}")
             return None
-        return code == b"" or code == b"0x"
 
     def get_balance(self, address: str | list[str]) -> float | dict[str, float]:
         """
@@ -630,16 +645,14 @@ class WebClient:
           2. Batch 2: Get metadata (slot0, reserves) for found pools.
           3. Calculate price locally.
         """
+        eth_zero = "0x0000000000000000000000000000000000000000"
         try:
-            token = self.w3.to_checksum_address(token_address)
+            if str(token_address).lower() == eth_zero:
+                token = self.WETH
+            else:
+                token = self.w3.to_checksum_address(token_address)
         except Exception:
             return None
-
-        # ABIs definitions
-        v3_factory_abi = [{"inputs": [{"type": "address", "name": "tA"}, {"type": "address", "name": "tB"}, {"type": "uint24", "name": "fee"}], "name": "getPool", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
-        v2_factory_abi = [{"inputs": [{"type": "address", "name": "tA"}, {"type": "address", "name": "tB"}], "name": "getPair", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
-        v3_pool_abi = [{"inputs": [], "name": "slot0", "outputs": [{"type": "uint160", "name": "sqrtPriceX96"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint8"}, {"type": "bool"}], "type": "function"}, {"inputs": [], "name": "liquidity", "outputs": [{"type": "uint128", "name": ""}], "type": "function"}, {"inputs": [], "name": "token0", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
-        v2_pair_abi = [{"inputs": [], "name": "getReserves", "outputs": [{"type": "uint112", "name": "r0"}, {"type": "uint112", "name": "r1"}, {"type": "uint32", "name": "ts"}], "type": "function"}, {"inputs": [], "name": "token0", "outputs": [{"type": "address", "name": ""}], "type": "function"}]
 
         # Contracts
         v3_fact = self.w3.eth.contract(address=self.UNISWAP_V3_FACTORY, abi=v3_factory_abi)
@@ -652,7 +665,7 @@ class WebClient:
 
         # Helper to add call
         def add_discovery(contract, func_name, args, meta):
-            data = contract.encodeABI(fn_name=func_name, args=args)
+            data = contract.get_function_by_name(func_name)(*args)._encode_transaction_data()
             calls_batch_1.append((contract.address, data))
             discovery_map.append(meta)
 
@@ -679,7 +692,7 @@ class WebClient:
 
         def add_data_call(addr, abi, method, pool_key, data_type):
             tmp_c = self.w3.eth.contract(address=addr, abi=abi)
-            calls_batch_2.append((addr, tmp_c.encodeABI(fn_name=method)))
+            calls_batch_2.append((addr, tmp_c.get_function_by_name(method)()._encode_transaction_data()))
             data_map.append({"key": pool_key, "type": data_type})
 
         # Process addresses
@@ -799,6 +812,9 @@ class WebClient:
                     weth_usd_price = R1/R0 if t0_addr == self.WETH else R0/R1
 
         # Final Calc
+        if token.lower() == self.WETH.lower():
+            if weth_usd_price:
+                return float(weth_usd_price)
         if best_price_weth and weth_usd_price:
             return float(best_price_weth * weth_usd_price)
 
