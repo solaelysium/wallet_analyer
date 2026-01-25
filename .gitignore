@@ -207,3 +207,5 @@ __marimo__/
 *.ipynb
 *.db
 *.zip
+*.db-shm
+*.db-wal

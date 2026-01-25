@@ -14,61 +14,77 @@ class DataHandler:
         # in-memory cache: (blockchain, addr_key, day_start_ms) -> float
         self._price_cache = {}
 
-    def get_wallet_age(self, ERC20_TXS: list[dict]) -> float:
+    def get_wallet_age(self, ERC20_TXS: list[dict] | None, internal_txs: list[dict] | None = None) -> float:
         """
-        Get the age of the wallet (from first ERC20 transfer)
+        Get the age of the wallet (from first tx across ERC20 + internal)
 
         Args:
         - `ERC20_TXS (list[dict])`: List of ERC20 transactions info
+        - `internal_txs (list[dict])`: List of internal transactions info
 
         Returns:
         - `float`: Age of the wallet, days
         """
-        first = ERC20_TXS[0]
-        start_date = datetime.fromtimestamp(int(first["timeStamp"]))
-        current_date = datetime.now()
-        wallet_age = (current_date - start_date).days
-        return wallet_age
+        txs = [tx for tx in (ERC20_TXS or []) if tx] + [tx for tx in (internal_txs or []) if tx]
+        if not txs:
+            return 0
+        timestamps = [int(tx.get("timeStamp", 0) or 0) for tx in txs]
+        timestamps = [ts for ts in timestamps if ts > 0]
+        if not timestamps:
+            return 0
+        start_date = datetime.fromtimestamp(min(timestamps))
+        return (datetime.now() - start_date).days
 
-    def get_frequency_of_transactions(self, ERC20_TXS: list[dict]) -> float:
+    def get_frequency_of_transactions(self, ERC20_TXS: list[dict] | None, internal_txs: list[dict] | None = None) -> float:
         """
         Get the average frequency of transactions
 
         Args:
         - `ERC20_TXS (list[dict])`: List of ERC20 transactions info
+        - `internal_txs (list[dict])`: List of internal transactions info
 
         Returns:
         - `float`: Average frequency of transactions, transactions/day
         """
-        first = ERC20_TXS[0]
-        last = ERC20_TXS[-1]
-        start_date = datetime.fromtimestamp(int(first["timeStamp"]))
-        end_date = datetime.fromtimestamp(int(last["timeStamp"]))
-
-        days = (end_date - start_date).days
-
-        if days == 0:
-            logger.warning("Count of days is 0")
+        txs = [tx for tx in (ERC20_TXS or []) if tx] + [tx for tx in (internal_txs or []) if tx]
+        if not txs:
             return 0
-
-        frequency = len(ERC20_TXS) / days
+        timestamps = [int(tx.get("timeStamp", 0) or 0) for tx in txs]
+        timestamps = [ts for ts in timestamps if ts > 0]
+        if not timestamps:
+            return 0
+        start_date = datetime.fromtimestamp(min(timestamps))
+        end_date = datetime.fromtimestamp(max(timestamps))
+        days = (end_date - start_date).days
+        if days == 0:
+            return 0
+        block_numbers = {int(tx.get("blockNumber", 0) or 0) for tx in txs if int(tx.get("blockNumber", 0) or 0) > 0}
+        frequency = len(block_numbers) / days
         return round(frequency, 5)
 
-    def get_days_since_last_transaction(self, ERC20_TXS: list[dict]) -> float:
+    def get_days_since_last_transaction(self, ERC20_TXS: list[dict] | None, internal_txs: list[dict] | None = None) -> float:
         """
         Get the days since the last transaction
 
         Args:
         - `ERC20_TXS (list[dict])`: List of ERC20 transactions info ascending by block number
+        - `internal_txs (list[dict])`: List of internal transactions info
 
         Returns:
         - `float`: Days since the last transaction
         """
-
-        last = ERC20_TXS[-1]
-        return (datetime.now() - datetime.fromtimestamp(int(last["timeStamp"]))).days
+        txs = [tx for tx in (ERC20_TXS or []) if tx] + [tx for tx in (internal_txs or []) if tx]
+        if not txs:
+            return 0
+        timestamps = [int(tx.get("timeStamp", 0) or 0) for tx in txs]
+        timestamps = [ts for ts in timestamps if ts > 0]
+        if not timestamps:
+            return 0
+        last_ts = max(timestamps)
+        return (datetime.now() - datetime.fromtimestamp(last_ts)).days
 
     # TODO: Add suppport for other networks
+    # TODO: REPAIR FUCKING FUNCTION: in exp.ipynb i had written code properly, and now i have to add referent code in this function
     def get_price_token(
         self,
         network: str | None = None,
@@ -76,6 +92,7 @@ class DataHandler:
         token_address: str | None = None,
         token_id: str | None = None,
         timestamp: int | None = None,
+        block_number: int | None = None,
     ) -> float | None:
         """
         Get the price of the token.
@@ -89,6 +106,7 @@ class DataHandler:
         - `blockchain (str)`: Blockchain key (alias to network); default: "ethereum"
         - `token_address (str)`: Address of the token
         - `timestamp (int)`: Timestamp of the transaction
+        - `block_number (int)`: Block number for on-chain price fallback
 
         Returns:
         - `float`: Price of the token
@@ -101,141 +119,469 @@ class DataHandler:
 
         addr_key = token_address.lower()
         target_ms = int(timestamp) * 1000
-        dt = datetime.fromtimestamp(int(timestamp))
-        day_start_dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_start_ms = int(day_start_dt.timestamp() * 1000)
-        day_end_ms = day_start_ms + 86_400_000 - 1
+        window_ms = 30 * 60 * 1000
+        bucket = int(target_ms // window_ms)
 
-        cache_key = (blockchain, addr_key, day_start_ms)
+        active_blockchain = blockchain or network or getattr(getattr(self, "web_client", None), "NETWORK", "ethereum")
+        cache_key = (active_blockchain, addr_key, bucket)
         cached = self._price_cache.get(cache_key)
         if cached is not None:
             return cached
 
+        # 1) Exclusions (only for contract-address lookups)
         if token_id is None:
-            # 1) Exclusions
             try:
-                if DB.is_excluded(addr_key, blockchain=blockchain):
+                if DB.is_excluded(addr_key, blockchain=active_blockchain):
                     return None
             except Exception:
                 pass
 
-            # 2) Try existing quotes
-            try:
-                got = DB.query_nearest_price(addr_key, day_start_ms, day_end_ms, target_ms, blockchain=blockchain)
-                if got is not None:
-                    price = float(got)
-                    self._price_cache[cache_key] = price
-                    return price
-            except Exception:
-                pass
-
-        # 3) Fetch and backfill
-        # Strategy:
-        # - If token has no quotes at all -> fetch wide (today-360d .. today)
-        # - Else -> fetch incremental recent window (e.g., last 7 days) to fill gaps
-        end_dt = datetime.now()
-        has_any = False
+        # 2) DB lookup in +/- window
         try:
-            has_any = DB.has_any_quotes(addr_key, blockchain=blockchain)
+            got = DB.query_price_window(addr_key, target_ms, window_ms, blockchain=active_blockchain)
+            if got is not None:
+                price = float(got)
+                self._price_cache[cache_key] = price
+                return price
         except Exception:
             pass
 
-        if has_any:
-            start_dt = end_dt - timedelta(days=7)
-        else:
-            start_dt = end_dt - timedelta(days=360)
+        # 3) Coingecko fallback (disabled for now)
+        # dt = datetime.fromtimestamp(int(timestamp))
+        # start_date = (dt - timedelta(days=1)).strftime("%d-%m-%Y")
+        # end_date = (dt + timedelta(days=1)).strftime("%d-%m-%Y")
+        #
+        # cg_reason = None
+        # cg_failed = False
+        # try:
+        #     cg = self.web_client.coingecko_client
+        #     active_network = network or active_blockchain or getattr(getattr(self, "web_client", None), "NETWORK", "ethereum")
+        #
+        #     if token_id is not None:
+        #         payload = cg.get_historical_price_by_id(token_id=token_id, start_date=start_date, end_date=end_date)
+        #     else:
+        #         payload = cg.get_historical_price(network=active_network, token_address=addr_key, start_date=start_date, end_date=end_date)
+        #
+        #     reason = payload.get("error")
+        #     if reason is not None:
+        #         cg_reason = reason
+        #         cg_failed = True
+        #     else:
+        #         prices = payload.get("prices", [])
+        #         rows = []
+        #         for p in prices:
+        #             if not p or len(p) < 2:
+        #                 continue
+        #             ts_ms, px = int(p[0]), float(p[1])
+        #             rows.append((ts_ms, px))
+        #
+        #         if rows:
+        #             try:
+        #                 DB.insert_quotes_rows(addr_key, rows, blockchain=active_blockchain)
+        #             except Exception:
+        #                 pass
+        #
+        #         got = DB.query_price_window(addr_key, target_ms, window_ms, blockchain=active_blockchain)
+        #         if got is not None:
+        #             price = float(got)
+        #             self._price_cache[cache_key] = price
+        #             return price
+        #         cg_failed = True
+        # except Exception as e:
+        #     cg_reason = str(e)
+        #     cg_failed = True
+        #     logger.warning(f"Coingecko fetch failed for {addr_key}: {e}")
 
-        start_date = start_dt.strftime("%d-%m-%Y")
-        end_date = end_dt.strftime("%d-%m-%Y")
-
-        try:
-            cg = self.web_client.coingecko_client
-
-            active_network = network or blockchain or getattr(getattr(self, "web_client", None), "NETWORK", "ethereum")
-
-            if token_id is not None:
-                payload = cg.get_historical_price_by_id(token_id=token_id, start_date=start_date, end_date=end_date)
-            else:
-                payload = cg.get_historical_price(network=active_network, token_address=addr_key, start_date=start_date, end_date=end_date)
-
-            # Error handling
-            # TODO: Add support for other reasons (for example: 'Exceed time range')
-            if payload.get("error") is not None:
-                reason = payload["error"]
-                # do not exclude on transient/server-side errors like 429
-                if isinstance(reason, str) and ("429" not in reason and "Too Many Requests" not in reason):
-                    try:
-                        DB.add_excluded(addr_key, reason, blockchain=blockchain)
-                    except Exception:
-                        pass
-                    return None
-                # TODO: dict reasons are not handled for now
-
-                return None
-
-            prices = payload.get("prices", [])
-            rows = []
-
-            # Record prices
-            for p in prices:
-                if not p or len(p) < 2:
-                    continue
-                ts_ms, px = int(p[0]), float(p[1])
-                rows.append((ts_ms, px))
-            if rows:
+        # 4) On-chain fallback via DEX price
+        if block_number is not None:
+            try:
+                onchain_price = self.web_client.get_token_price_usd_at_block(token_address, int(block_number))
+            except Exception:
+                onchain_price = None
+            if onchain_price is not None:
+                price = float(onchain_price)
                 try:
-                    DB.insert_quotes_rows(addr_key, rows, blockchain=blockchain)
+                    DB.insert_quotes_rows(addr_key, [(target_ms, price)], blockchain=active_blockchain)
                 except Exception:
                     pass
-                try:
-                    got = DB.query_nearest_price(addr_key, day_start_ms, day_end_ms, target_ms, blockchain=blockchain)
-                    if got is not None:
-                        price = float(got)
-                        self._price_cache[cache_key] = price
-                        return price
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"Coingecko fetch failed for {addr_key}: {e}")
+                self._price_cache[cache_key] = price
+                return price
+
+        # if cg_failed and token_id is None and cg_reason is not None:
+        #     if isinstance(cg_reason, str) and ("429" not in cg_reason and "Too Many Requests" not in cg_reason):
+        #         try:
+        #             DB.add_excluded(addr_key, cg_reason, blockchain=active_blockchain)
+        #         except Exception:
+        #             pass
 
         return None
 
-    def get_stats(self, wallet_address: str, wallet_balance: float, ERC20_TXS: list[dict] = None) -> dict:
+    # TODO: REPAIR FUCKING FUNCTION: in exp.ipynb i had written code properly, and now i have to add referent code in this function
+    def get_stats(
+        self,
+        wallet_address: str,
+        wallet_balance: float,
+        ERC20_TXS: list[dict] = None,
+        internal_txs: list[dict] = None,
+    ) -> dict:
         """
         Get full stats of the account
 
         Args:
         - `wallet_address (str)`: Address of the wallet
         - `ERC20_TXS (list[dict])`: List of ERC20 transactions info ascending by block number
+        - `internal_txs (list[dict])`: List of internal transactions info
         - `balances_info (list[dict])`: List of token balances of the account
 
         Returns:
         - `dict`: Stats of the account
         """
 
-        # Guards
-        if not ERC20_TXS:
-            logger.warning("No transactions to analyze")
-            return None
-
         if self.web_client is None:
             logger.error("web_client is required for swap analysis")
             raise ValueError("web_client is required for swap analysis")
 
-        # Get lower case address
+        erc20_txs = [tx for tx in (ERC20_TXS or []) if tx]
+        internal_txs = [tx for tx in (internal_txs or []) if tx]
+        if not erc20_txs and not internal_txs:
+            logger.warning("No transactions to analyze")
+            return None
+
         wallet_address = wallet_address.lower()
+        zero_addr = "0x" + "0" * 40
+        blockchain = getattr(getattr(self, "web_client", None), "NETWORK", "ethereum") or "ethereum"
 
-        # Define counting data
-        counting_data = {
-            "total_out, $": 0.0,
-            "total_in, $": 0.0,
-            "total_gas, $": 0.0,
-        }
+        def _safe_int(val, default: int = 0) -> int:
+            try:
+                return int(val)
+            except Exception:
+                return default
 
-        LENGTH = len(ERC20_TXS) - 1
-        i = 0
+        def _lower(val: str | None) -> str:
+            return str(val).lower() if val is not None else ""
 
-        # Aggregation helpers
+        def group_by_block(txs: list[dict]) -> dict[int, list[dict]]:
+            grouped: dict[int, list[dict]] = {}
+            for tx in txs:
+                block = _safe_int(tx.get("blockNumber", 0))
+                grouped.setdefault(block, []).append(tx)
+            return grouped
+
+        def pick_tx(txs: list[dict], field: str, value: str) -> dict | None:
+            value = value.lower()
+            for tx in txs:
+                if _lower(tx.get(field, "")) == value:
+                    return tx
+            return txs[0] if txs else None
+
+        def wei_to_eth(tx: dict | None) -> float:
+            if not tx:
+                return 0.0
+            return _safe_int(tx.get("value", 0)) / 10**18
+
+        def erc20_amount(tx: dict | None) -> float:
+            if not tx:
+                return 0.0
+            decimals = _safe_int(tx.get("tokenDecimal", 0) or 0)
+            return _safe_int(tx.get("value", 0)) / (10**decimals if decimals else 1)
+
+        def token_symbol(tx: dict | None) -> str:
+            if not tx:
+                return ""
+            return tx.get("tokenSymbol") or ""
+
+        def token_address(tx: dict | None) -> str:
+            if not tx:
+                return ""
+            return tx.get("contractAddress") or ""
+
+        def gas_cost_eth(tx: dict | None) -> float:
+            if not tx:
+                return 0.0
+            gas_used = _safe_int(tx.get("gasUsed", 0) or 0)
+            gas_price = _safe_int(tx.get("gasPrice", 0) or 0)
+            return (gas_used * gas_price) / 10**18
+
+        def get_type_of_swap_transaction(address: str, internal_txs: list[dict], erc20_txs: list[dict]) -> dict:
+            eoa = address.lower()
+            internal_by_block = group_by_block(internal_txs)
+            erc20_by_block = group_by_block(erc20_txs)
+            unique_blocknumbers = sorted(set(internal_by_block) | set(erc20_by_block))
+            swap_types: dict[int, int] = {}
+
+            for blocknumber in unique_blocknumbers:
+                internal_list = internal_by_block.get(blocknumber, [])
+                erc20_list = erc20_by_block.get(blocknumber, [])
+
+                if internal_list and erc20_list:
+                    internal_from = _lower(internal_list[0].get("from"))
+                    internal_to = _lower(internal_list[0].get("to"))
+                    erc20_from = _lower(erc20_list[0].get("from"))
+                    erc20_to = _lower(erc20_list[0].get("to"))
+
+                    if internal_from == erc20_to:
+                        swap_types[blocknumber] = 1
+                    elif erc20_from == internal_to:
+                        swap_types[blocknumber] = 2
+                    else:
+                        swap_types[blocknumber] = 0
+                    continue
+
+                if internal_list:
+                    swap_types[blocknumber] = 0
+                    continue
+
+                if len(erc20_list) >= 2:
+                    tx_out_from = _lower(erc20_list[0].get("from"))
+                    tx_in_to = _lower(erc20_list[1].get("to"))
+                    if tx_out_from == eoa and tx_in_to == eoa:
+                        swap_types[blocknumber] = 3
+                    else:
+                        swap_types[blocknumber] = 0
+                else:
+                    swap_types[blocknumber] = 0
+
+            return swap_types
+
+        def get_swap_data(address: str, blocknumber_types: dict, internal_txs: list[dict], erc20_txs: list[dict]) -> dict:
+            eoa = address.lower()
+            internal_by_block = group_by_block(internal_txs)
+            erc20_by_block = group_by_block(erc20_txs)
+            result: dict[int, dict] = {}
+
+            for blocknumber, swap_type in blocknumber_types.items():
+                internal_list = internal_by_block.get(blocknumber, [])
+                erc20_list = erc20_by_block.get(blocknumber, [])
+
+                if swap_type == 1:
+                    internal_tx = pick_tx(internal_list, "from", eoa)
+                    erc20_tx = pick_tx(erc20_list, "to", eoa)
+                    gas_tx = internal_tx or erc20_tx
+
+                    eth_amount = wei_to_eth(internal_tx)
+                    token_amount = erc20_amount(erc20_tx)
+                    token = token_symbol(erc20_tx)
+                    token_addr = token_address(erc20_tx)
+                    ts = _safe_int((internal_tx or erc20_tx or {}).get("timeStamp", 0))
+                    block_num = _safe_int((internal_tx or erc20_tx or {}).get("blockNumber", 0))
+
+                    price_eth = self.get_price_token(
+                        blockchain=blockchain,
+                        token_id="ethereum",
+                        token_address=zero_addr,
+                        timestamp=ts,
+                        block_number=block_num,
+                    )
+                    if price_eth is None:
+                        continue
+
+                    gas_eth = gas_cost_eth(gas_tx)
+                    gas_usd = gas_eth * price_eth
+                    usd = eth_amount * price_eth
+
+                    result[blocknumber] = {
+                        "type": "ETH → Token",
+                        "send": {"token": "ETH", "token_address": zero_addr, "amount": eth_amount},
+                        "receive": {"token": token, "token_address": token_addr, "amount": token_amount},
+                        "usd_value": usd,
+                        "usd_out": usd,
+                        "usd_in": usd,
+                        "gas": {"amount_eth": gas_eth, "usd_value": gas_usd},
+                        "timestamp": ts,
+                        "block_number": block_num,
+                    }
+
+                elif swap_type == 2:
+                    internal_tx = pick_tx(internal_list, "to", eoa)
+                    erc20_tx = pick_tx(erc20_list, "from", eoa)
+                    gas_tx = internal_tx or erc20_tx
+
+                    eth_amount = wei_to_eth(internal_tx)
+                    token_amount = erc20_amount(erc20_tx)
+                    token = token_symbol(erc20_tx)
+                    token_addr = token_address(erc20_tx)
+                    ts = _safe_int((internal_tx or erc20_tx or {}).get("timeStamp", 0))
+                    block_num = _safe_int((internal_tx or erc20_tx or {}).get("blockNumber", 0))
+
+                    price_eth = self.get_price_token(
+                        blockchain=blockchain,
+                        token_id="ethereum",
+                        token_address=zero_addr,
+                        timestamp=ts,
+                        block_number=block_num,
+                    )
+                    if price_eth is None:
+                        continue
+
+                    gas_eth = gas_cost_eth(gas_tx)
+                    gas_usd = gas_eth * price_eth
+                    usd = eth_amount * price_eth
+
+                    result[blocknumber] = {
+                        "type": "Token → ETH",
+                        "send": {"token": token, "token_address": token_addr, "amount": token_amount},
+                        "receive": {"token": "ETH", "token_address": zero_addr, "amount": eth_amount},
+                        "usd_value": usd,
+                        "usd_out": usd,
+                        "usd_in": usd,
+                        "gas": {"amount_eth": gas_eth, "usd_value": gas_usd},
+                        "timestamp": ts,
+                        "block_number": block_num,
+                    }
+
+                elif swap_type == 3:
+                    erc20_out = pick_tx(erc20_list, "from", eoa)
+                    erc20_in = pick_tx(erc20_list, "to", eoa)
+                    gas_tx = erc20_out or erc20_in
+
+                    out_amount = erc20_amount(erc20_out)
+                    in_amount = erc20_amount(erc20_in)
+                    out_token = token_symbol(erc20_out)
+                    in_token = token_symbol(erc20_in)
+                    out_token_addr = token_address(erc20_out)
+                    in_token_addr = token_address(erc20_in)
+                    ts = _safe_int((erc20_out or erc20_in or {}).get("timeStamp", 0))
+                    block_num = _safe_int((erc20_out or erc20_in or {}).get("blockNumber", 0))
+
+                    price_out = self.get_price_token(
+                        blockchain=blockchain,
+                        token_address=out_token_addr,
+                        timestamp=ts,
+                        block_number=block_num,
+                    )
+                    price_in = self.get_price_token(
+                        blockchain=blockchain,
+                        token_address=in_token_addr,
+                        timestamp=ts,
+                        block_number=block_num,
+                    )
+                    price_eth = self.get_price_token(
+                        blockchain=blockchain,
+                        token_id="ethereum",
+                        token_address=zero_addr,
+                        timestamp=ts,
+                        block_number=block_num,
+                    )
+                    if price_out is None or price_in is None or price_eth is None:
+                        continue
+
+                    usd_out = out_amount * price_out
+                    usd_in = in_amount * price_in
+
+                    gas_eth = gas_cost_eth(gas_tx)
+                    gas_usd = gas_eth * price_eth
+
+                    result[blocknumber] = {
+                        "type": "Token → Token",
+                        "send": {"token": out_token, "token_address": out_token_addr, "amount": out_amount},
+                        "receive": {"token": in_token, "token_address": in_token_addr, "amount": in_amount},
+                        "usd_value": max(usd_out, usd_in),
+                        "usd_out": usd_out,
+                        "usd_in": usd_in,
+                        "gas": {"amount_eth": gas_eth, "usd_value": gas_usd},
+                        "timestamp": ts,
+                        "block_number": block_num,
+                    }
+
+            return result
+
+        def _compute_pnl_metrics(swaps: dict[int, dict]) -> dict:
+            positions: dict[str, dict] = {}
+            realized_pnl = 0.0
+            total_gas = 0.0
+            cash_out = 0.0
+            cash_in = 0.0
+
+            def _get_pos(addr: str) -> dict:
+                if addr not in positions:
+                    positions[addr] = {"qty": 0.0, "cost_usd": 0.0}
+                return positions[addr]
+
+            for block in sorted(swaps):
+                item = swaps[block]
+                t = item.get("type")
+                gas_usd = float(item.get("gas", {}).get("usd_value", 0.0) or 0.0)
+                total_gas += gas_usd
+
+                if t == "ETH → Token":
+                    buy_usd = float(item.get("usd_value", 0.0) or 0.0)
+                    cash_out += buy_usd
+                    recv = item.get("receive", {})
+                    addr = (recv.get("token_address") or "").lower()
+                    qty = float(recv.get("amount", 0.0) or 0.0)
+                    pos = _get_pos(addr)
+                    pos["qty"] += qty
+                    pos["cost_usd"] += buy_usd + gas_usd
+                elif t == "Token → ETH":
+                    sell_usd = float(item.get("usd_value", 0.0) or 0.0)
+                    cash_in += sell_usd
+                    send = item.get("send", {})
+                    addr = (send.get("token_address") or "").lower()
+                    qty = float(send.get("amount", 0.0) or 0.0)
+                    pos = _get_pos(addr)
+                    if pos["qty"] > 0:
+                        sell_qty = min(qty, pos["qty"])
+                        avg_cost = pos["cost_usd"] / pos["qty"] if pos["qty"] else 0.0
+                        cogs = avg_cost * sell_qty
+                        realized_pnl += sell_usd - cogs - gas_usd
+                        pos["qty"] -= sell_qty
+                        pos["cost_usd"] -= cogs
+                    else:
+                        realized_pnl += sell_usd - gas_usd
+                elif t == "Token → Token":
+                    notional = float(item.get("usd_value", 0.0) or 0.0)
+
+                    send = item.get("send", {})
+                    send_addr = (send.get("token_address") or "").lower()
+                    send_qty = float(send.get("amount", 0.0) or 0.0)
+                    send_pos = _get_pos(send_addr)
+                    if send_pos["qty"] > 0:
+                        sell_qty = min(send_qty, send_pos["qty"])
+                        avg_cost = send_pos["cost_usd"] / send_pos["qty"] if send_pos["qty"] else 0.0
+                        cogs = avg_cost * sell_qty
+                        realized_pnl += notional - cogs - gas_usd
+                        send_pos["qty"] -= sell_qty
+                        send_pos["cost_usd"] -= cogs
+                    else:
+                        realized_pnl += notional - gas_usd
+
+                    recv = item.get("receive", {})
+                    recv_addr = (recv.get("token_address") or "").lower()
+                    recv_qty = float(recv.get("amount", 0.0) or 0.0)
+                    recv_pos = _get_pos(recv_addr)
+                    recv_pos["qty"] += recv_qty
+                    recv_pos["cost_usd"] += notional
+
+            unrealized_pnl = 0.0
+            latest_block = self.web_client.get_latest_block()
+            for addr, pos in positions.items():
+                if pos["qty"] <= 0:
+                    continue
+                price = self.web_client.get_token_price_usd_at_block(addr, latest_block)
+                if price is None:
+                    continue
+                unrealized_pnl += pos["qty"] * float(price) - pos["cost_usd"]
+
+            total_pnl = realized_pnl + unrealized_pnl
+            invested = max(cash_out - cash_in, 0.0)
+            roi = total_pnl / invested if invested > 0 else 0.0
+
+            return {
+                "realized_pnl_usd": realized_pnl,
+                "unrealized_pnl_usd": unrealized_pnl,
+                "total_pnl_usd": total_pnl,
+                "roi": roi,
+                "invested_usd": invested,
+                "cash_out_usd": cash_out,
+                "cash_in_usd": cash_in,
+                "total_gas_usd": total_gas,
+                "positions": positions,
+            }
+
+        swap_types = get_type_of_swap_transaction(wallet_address, internal_txs, erc20_txs)
+        swaps_by_block = get_swap_data(wallet_address, swap_types, internal_txs, erc20_txs)
+
+        counting_data = {"total_out, $": 0.0, "total_in, $": 0.0, "total_gas, $": 0.0}
         swap_days = set()
         trade_values = []
         token_volume_by_symbol = {}
@@ -243,218 +589,73 @@ class DataHandler:
         gas_values = []
         swaps_count = 0
 
-        while i <= LENGTH - 4:
-            tx = ERC20_TXS[i]
-            tx_next = ERC20_TXS[i + 1] if i + 1 <= LENGTH else None
+        for block_num, swap in swaps_by_block.items():
+            ts = _safe_int(swap.get("timestamp", 0))
+            swap_type = swap.get("type")
+            send = swap.get("send", {})
+            recv = swap.get("receive", {})
+            usd_value = float(swap.get("usd_value", 0.0) or 0.0)
+            gas_usd = float(swap.get("gas", {}).get("usd_value", 0.0) or 0.0)
 
-            # * Some way for check SWAP:
-            # * 1) Check equal blocknumber for several transactions. If 'swap', 'execute' or '' in 'functionName'.lower() ---> Check by BOTH transactions
-            # * 2) If this block number does not have an equal pair, then if 'swap' in 'functionName'.lower() ---> Check by THIS transaction
-            # ! ALL WAYS MUST BE CHECKED BY THAT RULE: RESULT FIELDS 'FROM ADDRESS' AND 'TO ADDRESS' MUST BE EQUAL TO 'WALLET ADDRESS'
+            offer_out_usd = 0.0
+            offer_in_usd = 0.0
 
-            blocknumber = int(tx["blockNumber"])
-            blocknumber_next = int(tx_next["blockNumber"]) if tx_next else None
-
-            if tx_next is not None and blocknumber == blocknumber_next:
-                if "swap" in tx["functionName"].lower() or "execute" in tx["functionName"].lower() or "" == tx["functionName"].lower():
-                    from_addr = tx["from"].lower()
-                    to_addr = tx_next["to"].lower()
-                    if from_addr != wallet_address and to_addr != wallet_address:
-                        i += 2
-                        continue
-
-                    token_contract_out: str = tx["contractAddress"]
-                    token_symbol_out: str = tx["tokenSymbol"]
-                    token_decimal_out: int = int(tx["tokenDecimal"])
-                    amount_out: float = int(tx["value"]) / 10**token_decimal_out
-
-                    token_contract_in: str = tx_next["contractAddress"]
-                    token_symbol_in: str = tx_next["tokenSymbol"]
-                    token_decimal_in: int = int(tx_next["tokenDecimal"])
-                    amount_in: float = int(tx_next["value"]) / 10**token_decimal_in
-                    timestamp_in: int = int(tx_next["timeStamp"])
-
-                    gas_out: float = int(tx["gasUsed"]) * int(tx["gasPrice"]) / 10**18
-                    gas_in: float = int(tx_next["gasUsed"]) * int(tx_next["gasPrice"]) / 10**18
-                    gas_total: float = gas_out + gas_in
-
-                    i += 2
-                else:
-                    i += 2
-                    continue
-            else:
-                # if "swap" in tx["functionName"].lower():
-                #     receipt: dict = self.web_client.get_transcation_receipt(tx_hash=tx["hash"])
-                #     from_addr = receipt["from"].lower()
-                #     to_addr = "0x" + receipt["logs"][-1]["topics"][2].hex().lower()[-40:]
-                #     if from_addr != wallet_address and to_addr != wallet_address:
-                #         i += 1
-                #         continue
-
-                #     token_contract_out: str = receipt["logs"][0]["address"]
-                #     token_symbol_out: str = self.web_client.get_token_meta(token_contract_out)[0]
-                #     token_decimal_out: int = self.web_client.get_token_meta(token_contract_out)[1]
-                #     amount_out: float = int(receipt["logs"][0]["data"].hex(), 16) / 10**token_decimal_out
-
-                #     token_symbol_in: str = tx["tokenSymbol"]
-                #     token_decimal_in: int = int(tx["tokenDecimal"])
-                #     token_contract_in: str = tx["contractAddress"]
-                #     amount_in: float = int(tx["value"]) / 10**token_decimal_in
-                #     timestamp_in: int = int(tx["timeStamp"])
-
-                #     gas_total: float = int(tx["gasUsed"]) * int(tx["gasPrice"]) / 10**18
-
-                #     i += 1
-                # else:
-                #     i += 1
-                #     continue
-                # else:
-                if "swap" in tx["functionName"].lower() or "execute" in tx["functionName"].lower() or "" == tx["functionName"].lower:
-                    receipt: dict = self.web_client.get_transcation_receipt(tx_hash=tx["hash"])
-
-                    logs = receipt.get("logs", []) or []
-                    if not logs:
-                        i += 1
-                        continue
-
-                    ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-                    transfer_logs = [
-                        log
-                        for log in logs
-                        if isinstance(log.get("topics", []), list)
-                        and len(log["topics"]) >= 3
-                        and (
-                            (log["topics"][0].hex().lower() if hasattr(log["topics"][0], "hex") else str(log["topics"][0]).lower())
-                            == ERC20_TRANSFER_TOPIC0
-                        )
-                    ]
-                    if not transfer_logs:
-                        i += 1
-                        continue
-
-                    from_addr = (receipt.get("from") or "").lower()
-                    last_to_topic = transfer_logs[-1]["topics"][2]
-                    to_addr = "0x" + (last_to_topic.hex().lower()[-40:] if hasattr(last_to_topic, "hex") else str(last_to_topic).lower()[-40:])
-
-                    if from_addr != wallet_address and to_addr != wallet_address:
-                        i += 1
-                        continue
-
-                    token_contract_out: str = transfer_logs[0]["address"]
-                    token_symbol_out: str = self.web_client.get_token_meta(token_contract_out)[0]
-                    token_decimal_out: int = self.web_client.get_token_meta(token_contract_out)[1]
-                    data_field = transfer_logs[0].get("data", "0x0")
-                    try:
-                        raw_hex = data_field.hex() if hasattr(data_field, "hex") else str(data_field)
-                        amount_out: float = int(raw_hex, 16) / 10**token_decimal_out
-                    except Exception:
-                        amount_out = 0.0
-
-                    token_symbol_in: str = tx["tokenSymbol"]
-                    token_decimal_in: int = int(tx["tokenDecimal"])
-                    token_contract_in: str = tx["contractAddress"]
-                    amount_in: float = int(tx["value"]) / 10**token_decimal_in
-                    timestamp_in: int = int(tx["timeStamp"])
-
-                    gas_total: float = int(tx["gasUsed"]) * int(tx["gasPrice"]) / 10**18
-
-                    i += 1
-                else:
-                    i += 1
-                    continue
-
-            zero_addr = "0x" + "0" * 40
-            try:
-                price_token_out = self.get_price_token(blockchain="ethereum", token_address=token_contract_out, timestamp=timestamp_in)
-            except Exception:
-                price_token_out = None
-
-            if price_token_out is None:
-                # fallback: derive price at nearest block via on-chain DEX (UniV3/V2)
-                try:
-                    block_num = int(tx_next["blockNumber"]) if tx_next else int(tx["blockNumber"])
-                    price_token_out = self.web_client.get_token_price_usd_at_block(token_contract_out, block_num)
-                    logger.info(f"pool_price | out {token_contract_out} | block {block_num} | price {price_token_out}")
-                    if price_token_out is not None:
-                        try:
-                            addr_key = token_contract_out.lower()
-                            ts_ms = int(timestamp_in) * 1000
-                            DB.insert_quotes_rows(addr_key, [(ts_ms, float(price_token_out))], blockchain="ethereum")
-                        except Exception:
-                            pass
-                except Exception:
-                    price_token_out = None
-            # no auto-exclude here; keep processing
-            try:
-                price_token_in = self.get_price_token(blockchain="ethereum", token_address=token_contract_in, timestamp=timestamp_in)
-            except Exception:
-                price_token_in = None
-            if price_token_in is None:
-                try:
-                    block_num = int(tx_next["blockNumber"]) if tx_next else int(tx["blockNumber"])
-                    price_token_in = self.web_client.get_token_price_usd_at_block(token_contract_in, block_num)
-                    logger.info(f"pool_price | in {token_contract_in} | block {block_num} | price {price_token_in}")
-                    if price_token_in is not None:
-                        try:
-                            addr_key = token_contract_in.lower()
-                            ts_ms = int(timestamp_in) * 1000
-                            DB.insert_quotes_rows(addr_key, [(ts_ms, float(price_token_in))], blockchain="ethereum")
-                        except Exception:
-                            pass
-                except Exception:
-                    price_token_in = None
-            # no auto-exclude here; keep processing
-            try:
-                price_gas = self.get_price_token(blockchain="ethereum", token_id="ethereum", token_address=zero_addr, timestamp=timestamp_in)
-            except Exception:
-                price_gas = None
-
-            if price_token_out is None or price_token_in is None or price_gas is None:
-                # exclude tokens lacking price from both sources
-                try:
-                    zero_addr = "0x" + "0" * 40
-                    if token_contract_out and token_contract_out.lower() != zero_addr:
-                        DB.add_excluded(token_contract_out.lower(), "no_price: cg_and_onchain", blockchain="ethereum")
-                    if token_contract_in and token_contract_in.lower() != zero_addr:
-                        DB.add_excluded(token_contract_in.lower(), "no_price: cg_and_onchain", blockchain="ethereum")
-                except Exception:
-                    pass
-                continue
-
-            offer_out_usd = price_token_out * amount_out
-            offer_in_usd = price_token_in * amount_in
-            gas_usd = gas_total * price_gas
+            if swap_type == "ETH → Token":
+                offer_out_usd = float(swap.get("usd_out", 0.0) or 0.0)
+                offer_in_usd = float(swap.get("usd_in", 0.0) or 0.0)
+                token_volume_by_symbol["ETH"] = token_volume_by_symbol.get("ETH", 0.0) + usd_value
+                token_volume_by_symbol[recv.get("token", "")] = token_volume_by_symbol.get(recv.get("token", ""), 0.0) + usd_value
+            elif swap_type == "Token → ETH":
+                offer_out_usd = float(swap.get("usd_out", 0.0) or 0.0)
+                offer_in_usd = float(swap.get("usd_in", 0.0) or 0.0)
+                token_volume_by_symbol[send.get("token", "")] = token_volume_by_symbol.get(send.get("token", ""), 0.0) + usd_value
+                token_volume_by_symbol["ETH"] = token_volume_by_symbol.get("ETH", 0.0) + usd_value
+            elif swap_type == "Token → Token":
+                offer_out_usd = float(swap.get("usd_out", 0.0) or 0.0)
+                offer_in_usd = float(swap.get("usd_in", 0.0) or 0.0)
+                token_volume_by_symbol[send.get("token", "")] = token_volume_by_symbol.get(send.get("token", ""), 0.0) + offer_out_usd
+                token_volume_by_symbol[recv.get("token", "")] = token_volume_by_symbol.get(recv.get("token", ""), 0.0) + offer_in_usd
 
             counting_data["total_out, $"] += offer_out_usd
             counting_data["total_in, $"] += offer_in_usd
             counting_data["total_gas, $"] += gas_usd
 
-            swaps_count += 1
-            swap_days.add(datetime.fromtimestamp(timestamp_in).date())
-            trade_values.append(max(offer_out_usd, offer_in_usd))
-            token_volume_by_symbol[token_symbol_out] = token_volume_by_symbol.get(token_symbol_out, 0.0) + offer_out_usd
-            token_volume_by_symbol[token_symbol_in] = token_volume_by_symbol.get(token_symbol_in, 0.0) + offer_in_usd
-            unique_tokens.add(token_contract_out)
-            unique_tokens.add(token_contract_in)
+            if ts:
+                swap_days.add(datetime.fromtimestamp(ts).date())
+            trade_values.append(usd_value)
+            unique_tokens.add(send.get("token_address"))
+            unique_tokens.add(recv.get("token_address"))
             gas_values.append(gas_usd)
+            swaps_count += 1
 
-        # * Calculate some stats
-        days_since_last_transaction = self.get_days_since_last_transaction(ERC20_TXS)
+        all_txs = erc20_txs + internal_txs
+        timestamps = [_safe_int(tx.get("timeStamp", 0)) for tx in all_txs if _safe_int(tx.get("timeStamp", 0)) > 0]
+        block_numbers = {_safe_int(tx.get("blockNumber", 0)) for tx in all_txs if _safe_int(tx.get("blockNumber", 0)) > 0}
+        if timestamps:
+            first_ts = min(timestamps)
+            last_ts = max(timestamps)
+            days_span = max((datetime.fromtimestamp(last_ts) - datetime.fromtimestamp(first_ts)).days, 1)
+            wallet_age = (datetime.now() - datetime.fromtimestamp(first_ts)).days
+            frequency = round(len(block_numbers) / days_span, 5) if days_span > 0 else 0.0
+            days_since_last_transaction = (datetime.now() - datetime.fromtimestamp(last_ts)).days
+        else:
+            wallet_age = 0
+            frequency = 0.0
+            days_since_last_transaction = 0
 
-        zero_addr = "0x" + "0" * 40
-        yesterday_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        latest_block = self.web_client.get_latest_block()
+        now_ts = int(datetime.now().timestamp())
         price_eth = self.get_price_token(
-            blockchain="ethereum",
+            blockchain=blockchain,
             token_id="ethereum",
             token_address=zero_addr,
-            timestamp=int(yesterday_start.timestamp()),
+            timestamp=now_ts,
+            block_number=latest_block,
         )
 
         if price_eth is None:
             logger.warning("Price of ETH is not found")
             return None
-
-        wallet_balance = wallet_balance * price_eth
 
         # * Derived simple metrics
         dex_days_active = len(swap_days)
@@ -481,18 +682,20 @@ class DataHandler:
         denom = counting_data["total_out, $"] + counting_data["total_in, $"]
         gas_share = round(counting_data["total_gas, $"] * 100.0 / denom, 5) if denom else 0.0
 
+        pnl_metrics = _compute_pnl_metrics(swaps_by_block)
+
         # Core metrics for df (no derived ratios)
         descriptive_data = {
             # * Account info
-            "wallet_age": self.get_wallet_age(ERC20_TXS),
-            "frequency_of_transactions": self.get_frequency_of_transactions(ERC20_TXS),
+            "wallet_age": wallet_age,
+            "frequency_of_transactions": frequency,
             "last_activity": days_since_last_transaction,
             "total_balance": wallet_balance,
             # * Counting data
             "total_out, $": counting_data["total_out, $"],
             "total_in, $": counting_data["total_in, $"],
             "total_gas, $": counting_data["total_gas, $"],
-            "count_ERC20_TXS": LENGTH,
+            "count_ERC20_TXS": len(erc20_txs),
             # * DEX activity
             "dex_days_active": dex_days_active,
             "txs_per_active_day(dex)": txs_per_active_day,
@@ -508,6 +711,15 @@ class DataHandler:
             # * Gas
             "avg_gas_per_swap, $": avg_gas_per_swap,
             "gas_share, %": gas_share,
+            # * PnL
+            "realized_pnl_usd": pnl_metrics.get("realized_pnl_usd", 0.0),
+            "unrealized_pnl_usd": pnl_metrics.get("unrealized_pnl_usd", 0.0),
+            "total_pnl_usd": pnl_metrics.get("total_pnl_usd", 0.0),
+            "roi": pnl_metrics.get("roi", 0.0),
+            "invested_usd": pnl_metrics.get("invested_usd", 0.0),
+            "cash_out_usd": pnl_metrics.get("cash_out_usd", 0.0),
+            "cash_in_usd": pnl_metrics.get("cash_in_usd", 0.0),
+            "total_gas_usd": pnl_metrics.get("total_gas_usd", 0.0),
         }
 
         # Aggregate data

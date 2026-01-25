@@ -243,27 +243,38 @@ class DB:
             )
 
     @staticmethod
-    def query_nearest_price(addr_key: str, day_start_ms: int, day_end_ms: int, target_ms: int, blockchain: str = "ethereum") -> float | None:
+    def query_price_window(addr_key: str, target_ms: int, window_ms: int, blockchain: str = "ethereum") -> float | None:
         """
-        Query the nearest price for a given token address and timestamp
+        Query the nearest price within +/- window around target_ms
 
         Args:
         - `addr_key (str)`: Address of the token
-        - `day_start_ms (int)`: Start of the day in milliseconds
-        - `day_end_ms (int)`: End of the day in milliseconds
         - `target_ms (int)`: Target timestamp in milliseconds
+        - `window_ms (int)`: Window size in milliseconds
         """
+        if window_ms is None:
+            return None
+        try:
+            window_ms = int(window_ms)
+        except Exception:
+            return None
+        window_ms = abs(window_ms)
+        if window_ms == 0:
+            return None
+        start_ms = int(target_ms) - window_ms
+        end_ms = int(target_ms) + window_ms
+
         row = (
             _quotes_conn()
             .execute(
                 """
-            SELECT timestamp_ms, price
-            FROM quotes
-            WHERE blockchain=? AND token_address=? AND timestamp_ms BETWEEN ? AND ?
-            ORDER BY ABS(timestamp_ms - ?) ASC
-            LIMIT 1
-            """,
-                (blockchain, addr_key, day_start_ms, day_end_ms, target_ms),
+                SELECT timestamp_ms, price
+                FROM quotes
+                WHERE blockchain=? AND token_address=? AND timestamp_ms BETWEEN ? AND ?
+                ORDER BY ABS(timestamp_ms - ?) ASC
+                LIMIT 1
+                """,
+                (blockchain, addr_key, start_ms, end_ms, int(target_ms)),
             )
             .fetchone()
         )

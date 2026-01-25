@@ -131,7 +131,7 @@ def worker_process_addresses(addresses: list[str], t_idx: int, w_idx: int, web_c
                 # * Get transactions info (async wrapper over block-range, asc order)
                 stage = "fetch_erc20_txs"
                 ERC20_TXS = loop.run_until_complete(
-                    web_client.get_erc20_transactions_by_block_range_async(
+                    web_client.get_erc20_txs_by_block_range_async(
                         wallet_address=address,
                         sort="asc",
                         timeout_sec=float(os.getenv("ETHERSCAN_TIMEOUT", "60")),
@@ -139,6 +139,15 @@ def worker_process_addresses(addresses: list[str], t_idx: int, w_idx: int, web_c
                 )
 
                 logger.info("ERC20 transactions fetched")
+                stage = "fetch_internal_txs"
+                internal_txs = loop.run_until_complete(
+                    web_client.get_internal_txs_by_block_range_async(
+                        wallet_address=address,
+                        sort="asc",
+                        timeout_sec=float(os.getenv("ETHERSCAN_TIMEOUT", "60")),
+                    )
+                )
+                logger.info("Internal transactions fetched")
 
                 # * Get balance of wallet
                 stage = "get_balance"
@@ -160,7 +169,12 @@ def worker_process_addresses(addresses: list[str], t_idx: int, w_idx: int, web_c
 
                 # * Analyze data
                 stage = "analyze_stats"
-                stats = data_handler.get_stats(wallet_address=address, wallet_balance=balance, ERC20_TXS=ERC20_TXS)
+                stats = data_handler.get_stats(
+                    wallet_address=address,
+                    wallet_balance=balance,
+                    ERC20_TXS=ERC20_TXS,
+                    internal_txs=internal_txs,
+                )
 
                 if stats is None:
                     logger.warning("Stats not fetched")

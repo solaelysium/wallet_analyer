@@ -120,6 +120,7 @@ class WebClient:
 
         self.UNISWAP_V3_FACTORY = self.w3.to_checksum_address(config["UNISWAP_V3_FACTORY"])
         self.UNISWAP_V2_FACTORY = self.w3.to_checksum_address(config["UNISWAP_V2_FACTORY"])
+        self.ETH = '0x0000000000000000000000000000000000000000'
         self.WETH = self.w3.to_checksum_address(config["WETH"])
         self.USDC = self.w3.to_checksum_address(config["USDC"])
         self.MULTICALL_ADDR = self.w3.to_checksum_address(config["MULTICALL3"])
@@ -353,7 +354,7 @@ class WebClient:
         - `float`: Balance of the account if `address` is a single address
         - `dict[str, float]`: Balance of multiple accounts if `address` is a list of addresses
 
-        This balance is in basement units
+        This balance is in basement USD units
 
         Example:
         >>> web3_client.get_balance("0x742d35Cc6634C0532925a3b844Bc454e4438f44e")
@@ -371,7 +372,7 @@ class WebClient:
 
             try:
                 response = self._queued_etherscan(self.etherscan_client.get_eth_balance, address=address)
-                response = float(response) / 10**18
+                response = float(response) / 10**18 * self.get_token_price_usd_at_block(self.ETH, self.get_latest_block())
             except Exception as e:
                 logger.error(f"Error getting balance: {e}")
                 raise Exception(f"Error getting balance: {e}")
@@ -391,7 +392,7 @@ class WebClient:
                 try:
                     response = self._queued_etherscan(self.etherscan_client.get_eth_balance_multiple, addresses=addresses)
                     for resp in response:
-                        resp["balance"] = float(resp["balance"]) / 10**18
+                        resp["balance"] = float(resp["balance"]) / 10**18 * self.get_token_price_usd_at_block(self.ETH, self.get_latest_block())
                 except Exception as e:
                     logger.error(f"Error getting balance: {e}")
                     raise Exception(f"Error getting balance: {e}")
@@ -402,7 +403,7 @@ class WebClient:
 
                 return response
 
-    async def get_erc20_transactions_by_block_range_async(
+    async def get_erc20_txs_by_block_range_async(
         self,
         wallet_address: str | None = None,
         contract_address: str | None = None,
@@ -412,7 +413,7 @@ class WebClient:
         timeout_sec: float | None = None,
     ) -> list[dict]:
         """
-        Async wrapper for get_erc20_transactions_by_block_range using a thread offload.
+        Async wrapper for get_erc20_txs_by_block_range using a thread offload.
 
         Args:
         - `wallet_address (str | None)`: Address of the wallet
@@ -426,7 +427,7 @@ class WebClient:
         - `list[dict]`: List of ERC20 transactions
 
         Example:
-        >>> response = await web3_client.get_erc20_transactions_by_block_range_async(
+        >>> response = await web3_client.get_erc20_txs_by_block_range_async(
                                 wallet_address="0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
                                 sort="asc",
                                 timeout_sec=60)
@@ -463,14 +464,14 @@ class WebClient:
                 except Exception:
                     timeout_sec = 60.0
             return await asyncio.wait_for(
-                asyncio.to_thread(self.get_erc20_transactions_by_block_range, wallet_address, contract_address, startblock, endblock, sort),
+                asyncio.to_thread(self.get_erc20_txs_by_block_range, wallet_address, contract_address, startblock, endblock, sort),
                 timeout=timeout_sec,
             )
         except asyncio.TimeoutError:
             raise Exception(f"Etherscan fetch timed out after {timeout_sec}s")
 
     # TODO: Improve searching logic, I had not done this function
-    def get_erc20_transactions_by_block_range(
+    def get_erc20_txs_by_block_range(
         self,
         wallet_address: str | None = None,
         contract_address: str | None = None,
@@ -495,7 +496,7 @@ class WebClient:
         - `list[dict]`: List of ERC20 transactions
 
         Example:
-        >>> response = web3_client.get_erc20_transactions_by_block_range(wallet_address="0x742d35Cc6634C0532925a3b844Bc454e4438f44e", sort="asc")
+        >>> response = web3_client.get_erc20_txs_by_block_range(wallet_address="0x742d35Cc6634C0532925a3b844Bc454e4438f44e", sort="asc")
         >>> print(json.dumps(response[0], indent=4))
                 {
                         'blockNumber': '22696579',
@@ -559,6 +560,83 @@ class WebClient:
         else:
             # TODO: Implement search by both
             pass
+    
+    async def get_internal_txs_by_block_range_async(
+        self,
+        wallet_address: str | None = None,
+        startblock: int | None = None,
+        endblock: int | None = None,
+        sort: str = "asc",
+        timeout_sec: float | None = None,
+    ) -> list[dict]:
+        """
+        Async wrapper for get_internal_txs_by_block_range using a thread offload.
+
+        Args:
+        - `wallet_address (str | None)`: Address of the wallet
+        - `startblock (int | None)`: Start block, default: `0`
+        - `endblock (int | None)`: End block, default: `latest block`
+        - `sort (str)`: Sort order, default: `asc`
+        - `timeout_sec (float | None)`: Timeout in seconds, default: `60`
+
+        Returns:
+        - `list[dict]`: List of internal transactions
+        """
+        try:
+            if timeout_sec is None:
+                try:
+                    timeout_sec = float(os.getenv("ETHERSCAN_TIMEOUT", "60"))
+                except Exception:
+                    timeout_sec = 60.0
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.get_internal_txs_by_block_range, wallet_address, startblock, endblock, sort),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            raise Exception(f"Etherscan fetch timed out after {timeout_sec}s")
+
+    def get_internal_txs_by_block_range(
+        self,
+        wallet_address: str | None = None,
+        startblock: int | None = None,
+        endblock: int | None = None,
+        sort: str = "asc",
+    ) -> list[dict]:
+        """
+        Get internal transactions for an address by block range using Etherscan API.
+
+        About endpoint: https://docs.etherscan.io/api-endpoints/accounts#get-internal-transactions-by-address
+
+        Args:
+        - `wallet_address (str | None)`: Address of the wallet
+        - `startblock (int | None)`: Start block, default: `0`
+        - `endblock (int | None)`: End block, default: `latest block`
+        - `sort (str)`: Sort order, default: `asc`
+
+        Returns:
+        - `list[dict]`: List of internal transactions
+        """
+        endblock = self.get_latest_block() if endblock is None else endblock
+        startblock = 0 if startblock is None else startblock
+
+        if wallet_address is None:
+            logger.error("wallet_address must be provided")
+            raise ValueError("wallet_address must be provided")
+
+        try:
+            response = self._queued_etherscan(
+                self.etherscan_client.get_internal_txs_by_address,
+                address=wallet_address,
+                startblock=startblock,
+                endblock=endblock,
+                sort=sort,
+            )
+            return response
+        except Exception as e:
+            err_name = type(e).__name__
+            err_msg = str(e)
+            logger.error(f"Etherscan fetch failed ({err_name}): {err_msg} | wallet_address={wallet_address}")
+            raise Exception(f"Error getting internal transactions: {err_name}: {err_msg}")
 
     def get_transcation_receipt(self, tx_hash: str) -> dict:
         """
@@ -654,7 +732,7 @@ class WebClient:
         except Exception:
             return None
         token_lower = token.lower()
-
+ 
         # Contracts
         v3_fact = self.w3.eth.contract(address=self.UNISWAP_V3_FACTORY, abi=v3_factory_abi)
         v2_fact = self.w3.eth.contract(address=self.UNISWAP_V2_FACTORY, abi=v2_factory_abi)
