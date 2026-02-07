@@ -23,7 +23,7 @@ NETWORK = CONFIGS.CRYPTO.ETHEREUM_NETWORK  #! you must check it appropriately fo
 RPC_URL = CONFIGS.CRYPTO.ETHEREUM_MAINNET  #! you must check it appropriately for your contract
 CSV_PATH = os.path.join(CONFIGS.OUTPUT_DIR, f"{CHAIN_NAME}.csv")
 API_DELAY = float(os.getenv("API_DELAY", "0.5"))  # seconds
-MAX_TX_PER_WALLET = int(os.getenv("MAX_TX_PER_WALLET", "3000"))  # max count of transactions per wallet
+MAX_TX_PER_WALLET = int(os.getenv("MAX_TX_PER_WALLET", "15000"))  # max count of transactions per wallet
 MIN_TX_PER_WALLET = int(os.getenv("MIN_TX_PER_WALLET", "15"))  # min count of transactions per wallet
 
 

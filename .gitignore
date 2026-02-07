@@ -209,3 +209,4 @@ __marimo__/
 *.zip
 *.db-shm
 *.db-wal
+*.txt

@@ -541,14 +541,41 @@ class WebClient:
 
         if search_type == "SEARCH_BY_WALLET":
             try:
-                response = self._queued_etherscan(
-                    self.etherscan_client.get_erc20_token_transfer_events_by_address,
-                    address=wallet_address,
-                    startblock=startblock,
-                    endblock=endblock,
-                    sort=sort,
-                )
-                return response
+                results: list[dict] = []
+                cur_start = int(startblock)
+                cur_end = int(endblock)
+                last_boundary = None
+
+                while True:
+                    response = self._queued_etherscan(
+                        self.etherscan_client.get_erc20_token_transfer_events_by_address,
+                        address=wallet_address,
+                        startblock=cur_start,
+                        endblock=cur_end,
+                        sort=sort,
+                    )
+                    if not response:
+                        break
+
+                    results.extend(response)
+                    if sort == "asc":
+                        boundary = int(response[-1].get("blockNumber", cur_start))
+                        if last_boundary is not None and boundary <= last_boundary:
+                            break
+                        last_boundary = boundary
+                        cur_start = boundary + 1
+                        if cur_start > cur_end:
+                            break
+                    else:
+                        boundary = int(response[0].get("blockNumber", cur_end))
+                        if last_boundary is not None and boundary >= last_boundary:
+                            break
+                        last_boundary = boundary
+                        cur_end = boundary - 1
+                        if cur_end < cur_start:
+                            break
+
+                return results
             except Exception as e:
                 err_name = type(e).__name__
                 err_msg = str(e)
