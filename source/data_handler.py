@@ -279,10 +279,16 @@ class DataHandler:
                 return 0.0
             return _safe_int(tx.get("value", 0)) / 10**18
 
-        def erc20_amount(tx: dict | None) -> float:
+        def erc20_amount(tx: dict | None, addr: str | None = None) -> float:
             if not tx:
                 return 0.0
             decimals = _safe_int(tx.get("tokenDecimal", 0) or 0)
+            if decimals == 0 and addr:
+                try:
+                    _, meta_dec = self.web_client.get_token_meta(addr)
+                    decimals = int(meta_dec or 0)
+                except Exception:
+                    decimals = 0
             return _safe_int(tx.get("value", 0)) / (10**decimals if decimals else 1)
 
         def token_symbol(tx: dict | None) -> str:
@@ -348,6 +354,8 @@ class DataHandler:
             internal_by_block = group_by_block(internal_txs)
             erc20_by_block = group_by_block(erc20_txs)
             result: dict[int, dict] = {}
+            STABLES = {"USDT", "USDC", "DAI"}
+            MAX_USD = 8_000.0
 
             for blocknumber, swap_type in blocknumber_types.items():
                 internal_list = internal_by_block.get(blocknumber, [])
@@ -359,9 +367,9 @@ class DataHandler:
                     gas_tx = internal_tx or erc20_tx
 
                     eth_amount = wei_to_eth(internal_tx)
-                    token_amount = erc20_amount(erc20_tx)
-                    token = token_symbol(erc20_tx)
                     token_addr = token_address(erc20_tx)
+                    token_amount = erc20_amount(erc20_tx, token_addr)
+                    token = token_symbol(erc20_tx)
                     ts = _safe_int((internal_tx or erc20_tx or {}).get("timeStamp", 0))
                     block_num = _safe_int((internal_tx or erc20_tx or {}).get("blockNumber", 0))
 
@@ -374,10 +382,14 @@ class DataHandler:
                     )
                     if price_eth is None:
                         continue
+                    if price_eth > MAX_USD:
+                        continue
 
                     gas_eth = gas_cost_eth(gas_tx)
                     gas_usd = gas_eth * price_eth
                     usd = eth_amount * price_eth
+                    if usd > MAX_USD:
+                        continue
 
                     result[blocknumber] = {
                         "type": "ETH → Token",
@@ -390,6 +402,9 @@ class DataHandler:
                         "timestamp": ts,
                         "block_number": block_num,
                     }
+                    logger.info(
+                        f"swap {blocknumber} | ETH -> {token} | send {eth_amount} | recv {token_amount} | usd {usd}"
+                    )
 
                 elif swap_type == 2:
                     internal_tx = pick_tx(internal_list, "to", eoa)
@@ -397,9 +412,9 @@ class DataHandler:
                     gas_tx = internal_tx or erc20_tx
 
                     eth_amount = wei_to_eth(internal_tx)
-                    token_amount = erc20_amount(erc20_tx)
-                    token = token_symbol(erc20_tx)
                     token_addr = token_address(erc20_tx)
+                    token_amount = erc20_amount(erc20_tx, token_addr)
+                    token = token_symbol(erc20_tx)
                     ts = _safe_int((internal_tx or erc20_tx or {}).get("timeStamp", 0))
                     block_num = _safe_int((internal_tx or erc20_tx or {}).get("blockNumber", 0))
 
@@ -412,10 +427,14 @@ class DataHandler:
                     )
                     if price_eth is None:
                         continue
+                    if price_eth > MAX_USD:
+                        continue
 
                     gas_eth = gas_cost_eth(gas_tx)
                     gas_usd = gas_eth * price_eth
                     usd = eth_amount * price_eth
+                    if usd > MAX_USD:
+                        continue
 
                     result[blocknumber] = {
                         "type": "Token → ETH",
@@ -428,18 +447,21 @@ class DataHandler:
                         "timestamp": ts,
                         "block_number": block_num,
                     }
+                    logger.info(
+                        f"swap {blocknumber} | {token} -> ETH | send {token_amount} | recv {eth_amount} | usd {usd}"
+                    )
 
                 elif swap_type == 3:
                     erc20_out = pick_tx(erc20_list, "from", eoa)
                     erc20_in = pick_tx(erc20_list, "to", eoa)
                     gas_tx = erc20_out or erc20_in
 
-                    out_amount = erc20_amount(erc20_out)
-                    in_amount = erc20_amount(erc20_in)
-                    out_token = token_symbol(erc20_out)
-                    in_token = token_symbol(erc20_in)
                     out_token_addr = token_address(erc20_out)
                     in_token_addr = token_address(erc20_in)
+                    out_amount = erc20_amount(erc20_out, out_token_addr)
+                    in_amount = erc20_amount(erc20_in, in_token_addr)
+                    out_token = token_symbol(erc20_out)
+                    in_token = token_symbol(erc20_in)
                     ts = _safe_int((erc20_out or erc20_in or {}).get("timeStamp", 0))
                     block_num = _safe_int((erc20_out or erc20_in or {}).get("blockNumber", 0))
 
@@ -464,12 +486,16 @@ class DataHandler:
                     )
                     if price_out is None or price_in is None or price_eth is None:
                         continue
+                    if price_out > MAX_USD or price_in > MAX_USD or price_eth > MAX_USD:
+                        continue
 
-                    usd_out = out_amount * price_out
-                    usd_in = in_amount * price_in
+                    usd_out = out_amount if out_token in STABLES else out_amount * price_out
+                    usd_in = in_amount if in_token in STABLES else in_amount * price_in
 
                     gas_eth = gas_cost_eth(gas_tx)
                     gas_usd = gas_eth * price_eth
+                    if max(usd_out, usd_in) > MAX_USD:
+                        continue
 
                     result[blocknumber] = {
                         "type": "Token → Token",
@@ -482,6 +508,9 @@ class DataHandler:
                         "timestamp": ts,
                         "block_number": block_num,
                     }
+                    logger.info(
+                        f"swap {blocknumber} | {out_token} -> {in_token} | send {out_amount} | recv {in_amount} | usd {max(usd_out, usd_in)}"
+                    )
 
             return result
 
@@ -491,6 +520,8 @@ class DataHandler:
             total_gas = 0.0
             cash_out = 0.0
             cash_in = 0.0
+            wins = 0
+            losses = 0
 
             def _get_pos(addr: str) -> dict:
                 if addr not in positions:
@@ -523,11 +554,21 @@ class DataHandler:
                         sell_qty = min(qty, pos["qty"])
                         avg_cost = pos["cost_usd"] / pos["qty"] if pos["qty"] else 0.0
                         cogs = avg_cost * sell_qty
-                        realized_pnl += sell_usd - cogs - gas_usd
+                        trade_pnl = sell_usd - cogs - gas_usd
+                        realized_pnl += trade_pnl
+                        if trade_pnl > 0:
+                            wins += 1
+                        elif trade_pnl < 0:
+                            losses += 1
                         pos["qty"] -= sell_qty
                         pos["cost_usd"] -= cogs
                     else:
-                        realized_pnl += sell_usd - gas_usd
+                        trade_pnl = sell_usd - gas_usd
+                        realized_pnl += trade_pnl
+                        if trade_pnl > 0:
+                            wins += 1
+                        elif trade_pnl < 0:
+                            losses += 1
                 elif t == "Token → Token":
                     notional = float(item.get("usd_value", 0.0) or 0.0)
 
@@ -539,11 +580,21 @@ class DataHandler:
                         sell_qty = min(send_qty, send_pos["qty"])
                         avg_cost = send_pos["cost_usd"] / send_pos["qty"] if send_pos["qty"] else 0.0
                         cogs = avg_cost * sell_qty
-                        realized_pnl += notional - cogs - gas_usd
+                        trade_pnl = notional - cogs - gas_usd
+                        realized_pnl += trade_pnl
+                        if trade_pnl > 0:
+                            wins += 1
+                        elif trade_pnl < 0:
+                            losses += 1
                         send_pos["qty"] -= sell_qty
                         send_pos["cost_usd"] -= cogs
                     else:
-                        realized_pnl += notional - gas_usd
+                        trade_pnl = notional - gas_usd
+                        realized_pnl += trade_pnl
+                        if trade_pnl > 0:
+                            wins += 1
+                        elif trade_pnl < 0:
+                            losses += 1
 
                     recv = item.get("receive", {})
                     recv_addr = (recv.get("token_address") or "").lower()
@@ -565,6 +616,8 @@ class DataHandler:
             total_pnl = realized_pnl + unrealized_pnl
             invested = max(cash_out - cash_in, 0.0)
             roi = total_pnl / invested if invested > 0 else 0.0
+            total_trades = wins + losses
+            winrate = wins / total_trades if total_trades > 0 else 0.0
 
             return {
                 "realized_pnl_usd": realized_pnl,
@@ -576,6 +629,9 @@ class DataHandler:
                 "cash_in_usd": cash_in,
                 "total_gas_usd": total_gas,
                 "positions": positions,
+                "wins": wins,
+                "losses": losses,
+                "winrate": winrate,
             }
 
         swap_types = get_type_of_swap_transaction(wallet_address, internal_txs, erc20_txs)
@@ -720,6 +776,9 @@ class DataHandler:
             "cash_out_usd": pnl_metrics.get("cash_out_usd", 0.0),
             "cash_in_usd": pnl_metrics.get("cash_in_usd", 0.0),
             "total_gas_usd": pnl_metrics.get("total_gas_usd", 0.0),
+            "wins": pnl_metrics.get("wins", 0),
+            "losses": pnl_metrics.get("losses", 0),
+            "winrate": pnl_metrics.get("winrate", 0.0),
         }
 
         # Aggregate data

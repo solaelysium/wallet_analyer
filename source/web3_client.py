@@ -334,7 +334,8 @@ class WebClient:
             logger.error('Given address is empty')
             raise ValueError('Given address is empty')
         try:
-            code = self.w3.eth.get_code(address).hex()
+            addr = self.w3.to_checksum_address(address)
+            code = self.w3.eth.get_code(addr).hex()
             return len(code) <= 46
         except Exception as e:
             logger.error(f"Error getting code for address {address}: {e}")
@@ -460,7 +461,7 @@ class WebClient:
         try:
             if timeout_sec is None:
                 try:
-                    timeout_sec = float(os.getenv("ETHERSCAN_TIMEOUT", "60"))
+                    timeout_sec = float(os.getenv("ETHERSCAN_TIMEOUT", "100"))
                 except Exception:
                     timeout_sec = 60.0
             return await asyncio.wait_for(
@@ -545,17 +546,31 @@ class WebClient:
                 cur_start = int(startblock)
                 cur_end = int(endblock)
                 last_boundary = None
+                empty_retries = 0
+                max_empty_retries = 2
 
                 while True:
-                    response = self._queued_etherscan(
-                        self.etherscan_client.get_erc20_token_transfer_events_by_address,
-                        address=wallet_address,
-                        startblock=cur_start,
-                        endblock=cur_end,
-                        sort=sort,
-                    )
+                    try:
+                        response = self._queued_etherscan(
+                            self.etherscan_client.get_erc20_token_transfer_events_by_address,
+                            address=wallet_address,
+                            startblock=cur_start,
+                            endblock=cur_end,
+                            sort=sort,
+                        )
+                    except AssertionError as e:
+                        msg = str(e)
+                        if "No transactions found" in msg:
+                            return results
+                        raise
+
                     if not response:
+                        empty_retries += 1
+                        if empty_retries <= max_empty_retries:
+                            time.sleep(0.7)
+                            continue
                         break
+                    empty_retries = 0
 
                     results.extend(response)
                     if sort == "asc":
@@ -612,7 +627,7 @@ class WebClient:
         try:
             if timeout_sec is None:
                 try:
-                    timeout_sec = float(os.getenv("ETHERSCAN_TIMEOUT", "60"))
+                    timeout_sec = float(os.getenv("ETHERSCAN_TIMEOUT", "100"))
                 except Exception:
                     timeout_sec = 60.0
             return await asyncio.wait_for(
