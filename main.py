@@ -23,7 +23,7 @@ NETWORK = CONFIGS.CRYPTO.ETHEREUM_NETWORK  #! you must check it appropriately fo
 RPC_URL = CONFIGS.CRYPTO.ETHEREUM_MAINNET  #! you must check it appropriately for your contract
 CSV_PATH = os.path.join(CONFIGS.OUTPUT_DIR, f"{CHAIN_NAME}.csv")
 API_DELAY = float(os.getenv("API_DELAY", "0.5"))  # seconds
-MAX_TX_PER_WALLET = int(os.getenv("MAX_TX_PER_WALLET", "15000"))  # max count of transactions per wallet
+MAX_TX_PER_WALLET = int(os.getenv("MAX_TX_PER_WALLET", "20000"))  # max count of transactions per wallet
 MIN_TX_PER_WALLET = int(os.getenv("MIN_TX_PER_WALLET", "15"))  # min count of transactions per wallet
 
 
@@ -134,7 +134,7 @@ def worker_process_addresses(addresses: list[str], t_idx: int, w_idx: int, web_c
                     web_client.get_erc20_txs_by_block_range_async(
                         wallet_address=address,
                         sort="asc",
-                        timeout_sec=float(os.getenv("ETHERSCAN_TIMEOUT", "60")),
+                        timeout_sec=float(os.getenv("ETHERSCAN_TIMEOUT", "100")),
                     )
                 )
 
@@ -144,7 +144,7 @@ def worker_process_addresses(addresses: list[str], t_idx: int, w_idx: int, web_c
                     web_client.get_internal_txs_by_block_range_async(
                         wallet_address=address,
                         sort="asc",
-                        timeout_sec=float(os.getenv("ETHERSCAN_TIMEOUT", "60")),
+                        timeout_sec=float(os.getenv("ETHERSCAN_TIMEOUT", "100")),
                     )
                 )
                 logger.info("Internal transactions fetched")

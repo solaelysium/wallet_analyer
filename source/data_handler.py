@@ -516,6 +516,7 @@ class DataHandler:
 
         def _compute_pnl_metrics(swaps: dict[int, dict]) -> dict:
             positions: dict[str, dict] = {}
+            price_by_token: dict[str, float] = {}
             realized_pnl = 0.0
             total_gas = 0.0
             cash_out = 0.0
@@ -525,8 +526,45 @@ class DataHandler:
 
             def _get_pos(addr: str) -> dict:
                 if addr not in positions:
-                    positions[addr] = {"qty": 0.0, "cost_usd": 0.0}
+                    positions[addr] = {"qty": 0.0, "cost_usd": 0.0, "lots": []}
                 return positions[addr]
+
+            def _add_lot(addr: str, qty: float, cost_usd: float) -> None:
+                if qty <= 0 or cost_usd <= 0:
+                    return
+                pos = _get_pos(addr)
+                pos["lots"].append({"qty": qty, "cost_usd": cost_usd})
+                pos["qty"] += qty
+                pos["cost_usd"] += cost_usd
+
+            def _consume_lots(addr: str, qty: float) -> tuple[float, float]:
+                if qty <= 0:
+                    return 0.0, 0.0
+                pos = _get_pos(addr)
+                remaining = qty
+                cogs = 0.0
+                sold = 0.0
+                lots = pos["lots"]
+                while remaining > 0 and lots:
+                    lot = lots[0]
+                    lot_qty = float(lot.get("qty", 0.0) or 0.0)
+                    lot_cost = float(lot.get("cost_usd", 0.0) or 0.0)
+                    if lot_qty <= 0:
+                        lots.pop(0)
+                        continue
+                    take = lot_qty if lot_qty <= remaining else remaining
+                    cost_part = (lot_cost * (take / lot_qty)) if lot_qty > 0 else 0.0
+                    cogs += cost_part
+                    sold += take
+                    remaining -= take
+                    if take >= lot_qty:
+                        lots.pop(0)
+                    else:
+                        lot["qty"] = lot_qty - take
+                        lot["cost_usd"] = max(lot_cost - cost_part, 0.0)
+                pos["qty"] = max(pos["qty"] - sold, 0.0)
+                pos["cost_usd"] = max(pos["cost_usd"] - cogs, 0.0)
+                return cogs, sold
 
             for block in sorted(swaps):
                 item = swaps[block]
@@ -540,68 +578,44 @@ class DataHandler:
                     recv = item.get("receive", {})
                     addr = (recv.get("token_address") or "").lower()
                     qty = float(recv.get("amount", 0.0) or 0.0)
-                    pos = _get_pos(addr)
-                    pos["qty"] += qty
-                    pos["cost_usd"] += buy_usd + gas_usd
+                    _add_lot(addr, qty, buy_usd + gas_usd)
+                    if qty > 0 and buy_usd > 0:
+                        price_by_token[addr] = buy_usd / qty
                 elif t == "Token → ETH":
                     sell_usd = float(item.get("usd_value", 0.0) or 0.0)
                     cash_in += sell_usd
                     send = item.get("send", {})
                     addr = (send.get("token_address") or "").lower()
                     qty = float(send.get("amount", 0.0) or 0.0)
-                    pos = _get_pos(addr)
-                    if pos["qty"] > 0:
-                        sell_qty = min(qty, pos["qty"])
-                        avg_cost = pos["cost_usd"] / pos["qty"] if pos["qty"] else 0.0
-                        cogs = avg_cost * sell_qty
-                        trade_pnl = sell_usd - cogs - gas_usd
-                        realized_pnl += trade_pnl
-                        if trade_pnl > 0:
-                            wins += 1
-                        elif trade_pnl < 0:
-                            losses += 1
-                        pos["qty"] -= sell_qty
-                        pos["cost_usd"] -= cogs
-                    else:
-                        trade_pnl = sell_usd - gas_usd
-                        realized_pnl += trade_pnl
-                        if trade_pnl > 0:
-                            wins += 1
-                        elif trade_pnl < 0:
-                            losses += 1
+                    cogs, _ = _consume_lots(addr, qty)
+                    trade_pnl = sell_usd - cogs - gas_usd
+                    realized_pnl += trade_pnl
+                    if trade_pnl > 0:
+                        wins += 1
+                    elif trade_pnl < 0:
+                        losses += 1
                 elif t == "Token → Token":
-                    notional = float(item.get("usd_value", 0.0) or 0.0)
+                    notional = float(item.get("usd_in", 0.0) or 0.0)
+                    if notional <= 0:
+                        notional = float(item.get("usd_value", 0.0) or 0.0)
 
                     send = item.get("send", {})
                     send_addr = (send.get("token_address") or "").lower()
                     send_qty = float(send.get("amount", 0.0) or 0.0)
-                    send_pos = _get_pos(send_addr)
-                    if send_pos["qty"] > 0:
-                        sell_qty = min(send_qty, send_pos["qty"])
-                        avg_cost = send_pos["cost_usd"] / send_pos["qty"] if send_pos["qty"] else 0.0
-                        cogs = avg_cost * sell_qty
-                        trade_pnl = notional - cogs - gas_usd
-                        realized_pnl += trade_pnl
-                        if trade_pnl > 0:
-                            wins += 1
-                        elif trade_pnl < 0:
-                            losses += 1
-                        send_pos["qty"] -= sell_qty
-                        send_pos["cost_usd"] -= cogs
-                    else:
-                        trade_pnl = notional - gas_usd
-                        realized_pnl += trade_pnl
-                        if trade_pnl > 0:
-                            wins += 1
-                        elif trade_pnl < 0:
-                            losses += 1
+                    cogs, _ = _consume_lots(send_addr, send_qty)
+                    trade_pnl = notional - cogs - gas_usd
+                    realized_pnl += trade_pnl
+                    if trade_pnl > 0:
+                        wins += 1
+                    elif trade_pnl < 0:
+                        losses += 1
 
                     recv = item.get("receive", {})
                     recv_addr = (recv.get("token_address") or "").lower()
                     recv_qty = float(recv.get("amount", 0.0) or 0.0)
-                    recv_pos = _get_pos(recv_addr)
-                    recv_pos["qty"] += recv_qty
-                    recv_pos["cost_usd"] += notional
+                    _add_lot(recv_addr, recv_qty, notional)
+                    if recv_qty > 0 and notional > 0:
+                        price_by_token[recv_addr] = notional / recv_qty
 
             unrealized_pnl = 0.0
             latest_block = self.web_client.get_latest_block()
@@ -614,7 +628,7 @@ class DataHandler:
                 unrealized_pnl += pos["qty"] * float(price) - pos["cost_usd"]
 
             total_pnl = realized_pnl + unrealized_pnl
-            invested = max(cash_out - cash_in, 0.0)
+            invested = cash_out
             roi = total_pnl / invested if invested > 0 else 0.0
             total_trades = wins + losses
             winrate = wins / total_trades if total_trades > 0 else 0.0
@@ -629,6 +643,7 @@ class DataHandler:
                 "cash_in_usd": cash_in,
                 "total_gas_usd": total_gas,
                 "positions": positions,
+                "price_by_token": price_by_token,
                 "wins": wins,
                 "losses": losses,
                 "winrate": winrate,

@@ -548,6 +548,8 @@ class WebClient:
                 last_boundary = None
                 empty_retries = 0
                 max_empty_retries = 2
+                rate_retries = 0
+                max_rate_retries = 4
 
                 while True:
                     try:
@@ -560,6 +562,12 @@ class WebClient:
                         )
                     except AssertionError as e:
                         msg = str(e)
+                        if "rate limit" in msg.lower() or "max calls per sec" in msg.lower():
+                            rate_retries += 1
+                            if rate_retries <= max_rate_retries:
+                                time.sleep(1.5 * rate_retries)
+                                continue
+                            raise
                         if "No transactions found" in msg:
                             return results
                         raise
@@ -570,6 +578,7 @@ class WebClient:
                             time.sleep(0.7)
                             continue
                         break
+                    rate_retries = 0
                     empty_retries = 0
 
                     results.extend(response)
@@ -666,14 +675,27 @@ class WebClient:
             raise ValueError("wallet_address must be provided")
 
         try:
-            response = self._queued_etherscan(
-                self.etherscan_client.get_internal_txs_by_address,
-                address=wallet_address,
-                startblock=startblock,
-                endblock=endblock,
-                sort=sort,
-            )
-            return response
+            rate_retries = 0
+            max_rate_retries = 4
+            while True:
+                try:
+                    response = self._queued_etherscan(
+                        self.etherscan_client.get_internal_txs_by_address,
+                        address=wallet_address,
+                        startblock=startblock,
+                        endblock=endblock,
+                        sort=sort,
+                    )
+                    return response
+                except AssertionError as e:
+                    msg = str(e)
+                    if "rate limit" in msg.lower() or "max calls per sec" in msg.lower():
+                        rate_retries += 1
+                        if rate_retries <= max_rate_retries:
+                            time.sleep(1.5 * rate_retries)
+                            continue
+                        raise
+                    raise
         except Exception as e:
             err_name = type(e).__name__
             err_msg = str(e)
