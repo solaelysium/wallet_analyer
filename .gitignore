@@ -136,6 +136,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -204,9 +206,13 @@ __marimo__/
 
 # Additional folders and files
 /outputs
+/data
+/frontend/node_modules
+/frontend/dist
 *.ipynb
 *.db
 *.zip
 *.db-shm
 *.db-wal
-*.txt
+/address_list.txt
+/unique_addresses.txt
