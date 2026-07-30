@@ -67,6 +67,7 @@ class TokenRepository(Repository):
         name: str | None,
         decimals: int,
     ) -> Token:
+        valid_decimals = decimals if 0 <= decimals <= 255 else None
         token = self.session.scalar(
             select(Token).where(
                 Token.chain_id == chain_id,
@@ -79,14 +80,15 @@ class TokenRepository(Repository):
                 address=address.lower(),
                 symbol=symbol,
                 name=name,
-                decimals=decimals,
+                decimals=valid_decimals if valid_decimals is not None else 18,
                 suspicious=is_suspicious_token_symbol(symbol),
             )
             self.add(token)
         else:
             token.symbol = symbol or token.symbol
             token.name = name or token.name
-            token.decimals = decimals
+            if valid_decimals is not None:
+                token.decimals = valid_decimals
             token.suspicious = is_suspicious_token_symbol(token.symbol)
         return token
 

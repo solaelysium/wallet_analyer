@@ -47,6 +47,11 @@ class RpcProvider(ABC):
     ) -> float | None:
         return None
 
+    def token_decimals(
+        self, token_address: str, block: int | str = "latest"
+    ) -> int | None:
+        return None
+
 
 class HistoricalPriceProvider(ABC):
     @abstractmethod
@@ -217,11 +222,14 @@ class InfuraProvider(RpcProvider):
         block_tag = hex(block) if isinstance(block, int) else block
         return str(self.rpc("eth_call", [{"to": to, "data": data}, block_tag]))
 
-    def token_decimals(self, address: str, block: int | str = "latest") -> int:
+    def token_decimals(
+        self, address: str, block: int | str = "latest"
+    ) -> int | None:
         try:
-            return int(self.eth_call(address, "0x313ce567", block), 16)
+            value = int(self.eth_call(address, "0x313ce567", block), 16)
+            return value if 0 <= value <= 255 else None
         except Exception:
-            return 18
+            return None
 
     @staticmethod
     def _encode_address(address: str) -> str:
@@ -292,6 +300,8 @@ class InfuraProvider(RpcProvider):
             if token.lower() == self.weth.lower():
                 return weth_usd
             decimals = self.token_decimals(token, block_number)
+            if decimals is None:
+                return None
             direct = self._v2_quote(
                 token, self.usdc, decimals, 6, block_number
             )

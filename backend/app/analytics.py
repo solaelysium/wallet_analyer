@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from statistics import mean, median
 
 from sqlalchemy import func, select
@@ -20,11 +21,18 @@ from .models import (
 )
 from .providers import HistoricalPriceProvider, RpcProvider
 from .repositories import TokenRepository
+from .token_rules import (
+    ETH_LIKE_ADDRESSES,
+    NATIVE_ADDRESS,
+    STABLECOINS,
+    WETH_ADDRESS,
+    asset_kind,
+    is_trusted_quote_asset,
+)
 
 
-FEATURE_VERSION = "wallet_features.v2"
-NATIVE_ADDRESS = "0x0000000000000000000000000000000000000000"
-STABLE_SYMBOLS = {"USDC", "USDT", "DAI", "TUSD", "USDP", "BUSD", "FRAX"}
+FEATURE_VERSION = "wallet_features.v3"
+TRADE_EVENT_TYPES = {"buy_like", "sell_like", "swap_like"}
 
 
 def safe_int(value: object, default: int = 0) -> int:
@@ -43,13 +51,23 @@ class AssetLeg:
     timestamp: int
     block_number: int
     tx_hash: str
+    decimals: int = 18
     price_usd: float | None = None
+    price_source: str | None = None
+    price_confidence: str = "none"
 
     @property
     def usd_value(self) -> float | None:
         if self.price_usd is None:
             return None
         return self.amount * self.price_usd
+
+
+@dataclass
+class PriceQuote:
+    price_usd: float
+    source: str
+    confidence: str
 
 
 class PriceResolver:
@@ -64,17 +82,17 @@ class PriceResolver:
         self.provider = provider
         self.rpc_provider = rpc_provider
         self.chain_id = chain_id
-        self.memory: dict[tuple[int, int], float | None] = {}
+        self.memory: dict[tuple[int, int], PriceQuote | None] = {}
 
     def _token(
         self, address: str, symbol: str | None = None, decimals: int = 18
     ) -> Token:
-        coin_id = "ethereum" if address == NATIVE_ADDRESS else None
+        coin_id = "ethereum" if address in ETH_LIKE_ADDRESSES else None
         token = TokenRepository(self.session).get_or_create(
             self.chain_id,
             address,
-            symbol or ("ETH" if address == NATIVE_ADDRESS else None),
-            "Ether" if address == NATIVE_ADDRESS else None,
+            symbol or ("ETH" if address in ETH_LIKE_ADDRESSES else None),
+            "Ether" if address in ETH_LIKE_ADDRESSES else None,
             decimals,
         )
         if coin_id and not token.coingecko_id:
@@ -89,8 +107,22 @@ class PriceResolver:
         timestamp: int,
         block_number: int | None = None,
     ) -> float | None:
-        if symbol.upper() in STABLE_SYMBOLS:
-            return 1.0
+        quote = self.resolve_quote(
+            address, symbol, decimals, timestamp, block_number
+        )
+        return quote.price_usd if quote else None
+
+    def resolve_quote(
+        self,
+        address: str,
+        symbol: str,
+        decimals: int,
+        timestamp: int,
+        block_number: int | None = None,
+    ) -> PriceQuote | None:
+        address = address.lower()
+        if address in STABLECOINS:
+            return PriceQuote(1.0, "canonical_stablecoin", "high")
         token = self._token(address.lower(), symbol, decimals)
         bucket = timestamp // 1800
         key = (token.id, bucket)
@@ -107,8 +139,17 @@ class PriceResolver:
             .limit(1)
         )
         if cached is not None:
-            self.memory[key] = cached.price_usd
-            return cached.price_usd
+            quote = PriceQuote(
+                cached.price_usd,
+                cached.source,
+                (
+                    "high"
+                    if address in ETH_LIKE_ADDRESSES
+                    else "medium" if cached.source == "coingecko" else "low"
+                ),
+            )
+            self.memory[key] = quote
+            return quote
         rows = []
         try:
             rows = self.provider.prices(
@@ -141,8 +182,13 @@ class PriceResolver:
         self.session.flush()
         if rows:
             price = min(rows, key=lambda item: abs(item[0] - timestamp))[1]
-            self.memory[key] = price
-            return price
+            quote = PriceQuote(
+                price,
+                "coingecko",
+                "high" if address in ETH_LIKE_ADDRESSES else "medium",
+            )
+            self.memory[key] = quote
+            return quote
         if block_number is not None:
             price = self.rpc_provider.token_price_usd_at_block(
                 token.address, block_number
@@ -158,8 +204,9 @@ class PriceResolver:
                     )
                 )
                 self.session.flush()
-                self.memory[key] = price
-                return price
+                quote = PriceQuote(price, "uniswap_v2", "low")
+                self.memory[key] = quote
+                return quote
         self.memory[key] = None
         return None
 
@@ -171,55 +218,101 @@ def group_transaction_legs(
     transfers: list[tuple[TokenTransfer, Token]],
 ) -> dict[str, list[AssetLeg]]:
     address = wallet.address.lower()
-    grouped: dict[str, list[AssetLeg]] = defaultdict(list)
+    net_moves: dict[tuple[str, str], dict] = {}
 
-    def native_leg(row: NormalTransaction | InternalTransaction) -> None:
-        amount = safe_int(row.value_wei) / 10**18
-        if amount <= 0:
+    def add_move(
+        tx_hash: str,
+        asset: str,
+        symbol: str,
+        decimals: int,
+        raw_delta: int,
+        timestamp: int,
+        block_number: int,
+    ) -> None:
+        if raw_delta == 0:
             return
-        from_address = (row.from_address or "").lower()
-        to_address = (row.to_address or "").lower()
-        if from_address == address:
-            direction = "out"
-        elif to_address == address:
-            direction = "in"
-        else:
-            return
-        grouped[row.tx_hash].append(
-            AssetLeg(
-                asset=NATIVE_ADDRESS,
-                symbol="ETH",
-                amount=amount,
-                direction=direction,
-                timestamp=row.timestamp,
-                block_number=row.block_number,
-                tx_hash=row.tx_hash,
+        key = (tx_hash, asset)
+        current = net_moves.setdefault(
+            key,
+            {
+                "tx_hash": tx_hash,
+                "asset": asset,
+                "symbol": symbol,
+                "decimals": decimals,
+                "raw_delta": 0,
+                "timestamp": timestamp,
+                "block_number": block_number,
+            },
+        )
+        current["raw_delta"] += raw_delta
+        if timestamp and not current["timestamp"]:
+            current["timestamp"] = timestamp
+        if block_number:
+            current["block_number"] = min(
+                current["block_number"] or block_number, block_number
             )
+
+    def native_move(row: NormalTransaction | InternalTransaction) -> None:
+        raw_value = safe_int(row.value_wei)
+        if raw_value <= 0:
+            return
+        delta = 0
+        if (row.from_address or "").lower() == address:
+            delta -= raw_value
+        if (row.to_address or "").lower() == address:
+            delta += raw_value
+        add_move(
+            row.tx_hash,
+            NATIVE_ADDRESS,
+            "ETH",
+            18,
+            delta,
+            row.timestamp,
+            row.block_number,
         )
 
     for row in normals:
-        native_leg(row)
+        native_move(row)
     for row in internals:
-        native_leg(row)
+        native_move(row)
     for transfer, token in transfers:
-        amount = safe_int(transfer.raw_value) / 10 ** max(token.decimals, 0)
-        if amount <= 0:
+        raw_value = safe_int(transfer.raw_value)
+        if raw_value <= 0:
             continue
+        delta = 0
         if transfer.from_address.lower() == address:
-            direction = "out"
-        elif transfer.to_address.lower() == address:
-            direction = "in"
-        else:
+            delta -= raw_value
+        if transfer.to_address.lower() == address:
+            delta += raw_value
+        add_move(
+            transfer.tx_hash,
+            token.address,
+            token.symbol or token.address[:10],
+            token.decimals,
+            delta,
+            transfer.timestamp,
+            transfer.block_number,
+        )
+
+    grouped: dict[str, list[AssetLeg]] = defaultdict(list)
+    for move in net_moves.values():
+        raw_delta = int(move["raw_delta"])
+        if raw_delta == 0:
             continue
-        grouped[transfer.tx_hash].append(
+        decimals = int(move["decimals"])
+        amount = float(
+            abs(Decimal(raw_delta)) / (Decimal(10) ** max(decimals, 0))
+        )
+        grouped[move["tx_hash"]].append(
             AssetLeg(
-                asset=token.address,
-                symbol=token.symbol or token.address[:10],
+                asset=move["asset"],
+                symbol=move["symbol"],
                 amount=amount,
-                direction=direction,
-                timestamp=transfer.timestamp,
-                block_number=transfer.block_number,
-                tx_hash=transfer.tx_hash,
+                direction="out" if raw_delta < 0 else "in",
+                timestamp=move["timestamp"],
+                block_number=move["block_number"],
+                tx_hash=move["tx_hash"],
+                decimals=decimals,
             )
         )
     return grouped
@@ -236,44 +329,149 @@ def aggregate_legs(legs: list[AssetLeg]) -> list[AssetLeg]:
     return list(aggregated.values())
 
 
-def derive_swaps(
+def classify_event(legs: list[AssetLeg]) -> str:
+    outgoing = [leg for leg in legs if leg.direction == "out"]
+    incoming = [leg for leg in legs if leg.direction == "in"]
+    out_kinds = {asset_kind(leg.asset) for leg in outgoing}
+    in_kinds = {asset_kind(leg.asset) for leg in incoming}
+    out_assets = {leg.asset for leg in outgoing}
+    in_assets = {leg.asset for leg in incoming}
+    if not outgoing and not incoming:
+        return "empty"
+    if outgoing and not incoming:
+        return "transfer_out"
+    if incoming and not outgoing:
+        return "transfer_in"
+    if (out_assets | in_assets) <= ETH_LIKE_ADDRESSES:
+        return "wrap_or_unwrap"
+    if len(outgoing) >= 2 and len(incoming) == 1:
+        return "maybe_liquidity_add"
+    if len(outgoing) == 1 and len(incoming) >= 2:
+        return "maybe_liquidity_remove"
+    if out_assets != in_assets:
+        if out_kinds & {"native", "weth", "stable"} and "token" in in_kinds:
+            return "buy_like"
+        if "token" in out_kinds and in_kinds & {"native", "weth", "stable"}:
+            return "sell_like"
+        return "swap_like"
+    return "self_transfer_or_rebalance"
+
+
+def _reliable_notional(
+    event_type: str,
+    outgoing: list[AssetLeg],
+    incoming: list[AssetLeg],
+) -> tuple[float, str, float | None]:
+    trusted_out = sum(
+        leg.usd_value or 0.0
+        for leg in outgoing
+        if is_trusted_quote_asset(leg.asset)
+    )
+    trusted_in = sum(
+        leg.usd_value or 0.0
+        for leg in incoming
+        if is_trusted_quote_asset(leg.asset)
+    )
+    if event_type == "buy_like" and trusted_out > 0:
+        return trusted_out, "high", None
+    if event_type == "sell_like" and trusted_in > 0:
+        return trusted_in, "high", None
+    if trusted_out > 0 or trusted_in > 0:
+        values = [value for value in (trusted_out, trusted_in) if value > 0]
+        divergence = (
+            abs(trusted_out - trusted_in) / max(trusted_out, trusted_in)
+            if trusted_out > 0 and trusted_in > 0
+            else None
+        )
+        return sum(values) / len(values), "high", divergence
+
+    priced_out = sum(leg.usd_value or 0.0 for leg in outgoing)
+    priced_in = sum(leg.usd_value or 0.0 for leg in incoming)
+    acceptable = all(
+        leg.price_usd is not None and leg.price_confidence in {"high", "medium"}
+        for leg in [*outgoing, *incoming]
+    )
+    if not acceptable or priced_out <= 0 or priced_in <= 0:
+        return 0.0, "none", None
+    divergence = abs(priced_out - priced_in) / max(priced_out, priced_in)
+    if divergence > 0.20:
+        return 0.0, "low", divergence
+    return (priced_out + priced_in) / 2, "medium", divergence
+
+
+def derive_events(
     grouped: dict[str, list[AssetLeg]],
     resolver: PriceResolver,
     gas_by_hash: dict[str, float] | None = None,
 ) -> list[dict]:
     gas_by_hash = gas_by_hash or {}
-    swaps = []
+    events = []
     for tx_hash, raw_legs in grouped.items():
         legs = aggregate_legs(raw_legs)
         outgoing = [leg for leg in legs if leg.direction == "out"]
         incoming = [leg for leg in legs if leg.direction == "in"]
-        if not outgoing or not incoming:
-            continue
         for leg in legs:
-            leg.price_usd = resolver.resolve(
-                leg.asset,
-                leg.symbol,
-                18,
-                leg.timestamp,
-                leg.block_number,
-            )
+            if hasattr(resolver, "resolve_quote"):
+                quote = resolver.resolve_quote(
+                    leg.asset,
+                    leg.symbol,
+                    leg.decimals,
+                    leg.timestamp,
+                    leg.block_number,
+                )
+                if quote is not None:
+                    leg.price_usd = quote.price_usd
+                    leg.price_source = quote.source
+                    leg.price_confidence = quote.confidence
+            else:
+                leg.price_usd = resolver.resolve(
+                    leg.asset,
+                    leg.symbol,
+                    leg.decimals,
+                    leg.timestamp,
+                    leg.block_number,
+                )
+                if leg.price_usd is not None:
+                    leg.price_source = "resolver"
+                    leg.price_confidence = (
+                        "high" if is_trusted_quote_asset(leg.asset) else "medium"
+                    )
         known_out = sum(leg.usd_value or 0.0 for leg in outgoing)
         known_in = sum(leg.usd_value or 0.0 for leg in incoming)
-        swaps.append(
+        event_type = classify_event(legs)
+        notional, valuation_confidence, divergence = _reliable_notional(
+            event_type, outgoing, incoming
+        )
+        events.append(
             {
                 "tx_hash": tx_hash,
                 "timestamp": min(leg.timestamp for leg in legs),
                 "block_number": min(leg.block_number for leg in legs),
+                "event_type": event_type,
                 "outgoing": [leg.__dict__ | {"usd_value": leg.usd_value} for leg in outgoing],
                 "incoming": [leg.__dict__ | {"usd_value": leg.usd_value} for leg in incoming],
                 "usd_out": known_out,
                 "usd_in": known_in,
-                "usd_value": max(known_out, known_in),
+                "usd_value": notional,
+                "valuation_confidence": valuation_confidence,
+                "valuation_divergence": divergence,
                 "gas_usd": gas_by_hash.get(tx_hash, 0.0),
                 "is_multi_leg": len(outgoing) > 1 or len(incoming) > 1,
             }
         )
-    return sorted(swaps, key=lambda item: (item["timestamp"], item["tx_hash"]))
+    return sorted(events, key=lambda item: (item["timestamp"], item["tx_hash"]))
+
+
+def derive_swaps(
+    grouped: dict[str, list[AssetLeg]],
+    resolver: PriceResolver,
+    gas_by_hash: dict[str, float] | None = None,
+) -> list[dict]:
+    return [
+        event
+        for event in derive_events(grouped, resolver, gas_by_hash)
+        if event["event_type"] in TRADE_EVENT_TYPES
+    ]
 
 
 def compute_fifo_pnl(
@@ -290,6 +488,7 @@ def compute_fifo_pnl(
     wins = 0
     losses = 0
     symbols: dict[str, str] = {}
+    decimals_by_asset: dict[str, int] = {}
 
     def add_lot(asset: str, quantity: float, cost: float) -> None:
         if quantity > 0 and cost >= 0:
@@ -317,47 +516,74 @@ def compute_fifo_pnl(
     for swap in sorted(swaps, key=lambda item: (item.get("timestamp", 0), item.get("tx_hash", ""))):
         outgoing = swap.get("outgoing", [])
         incoming = swap.get("incoming", [])
-        total_out = float(swap.get("usd_out", 0.0) or 0.0)
-        total_in = float(swap.get("usd_in", 0.0) or 0.0)
-        notional = max(total_out, total_in)
+        notional = float(
+            swap.get(
+                "usd_value",
+                max(
+                    float(swap.get("usd_out", 0.0) or 0.0),
+                    float(swap.get("usd_in", 0.0) or 0.0),
+                ),
+            )
+            or 0.0
+        )
         gas_usd = float(swap.get("gas_usd", 0.0) or 0.0)
         total_gas += gas_usd
+        outgoing_cash = any(
+            is_trusted_quote_asset(str(leg.get("asset", "")))
+            for leg in outgoing
+        )
+        incoming_cash = any(
+            is_trusted_quote_asset(str(leg.get("asset", "")))
+            for leg in incoming
+        )
+        if outgoing_cash and notional > 0:
+            invested += notional
+            cash_out += notional
         sold_cost = 0.0
         sold_any = False
         for leg in outgoing:
             asset = str(leg.get("asset", "")).lower()
             quantity = float(leg.get("amount", 0.0) or 0.0)
-            if asset == NATIVE_ADDRESS or str(leg.get("symbol", "")).upper() in STABLE_SYMBOLS:
-                cash_value = float(leg.get("usd_value", 0.0) or 0.0)
-                invested += cash_value
-                cash_out += cash_value
+            if is_trusted_quote_asset(asset):
                 continue
             symbols[asset] = str(leg.get("symbol", ""))
+            decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
             cost, consumed = consume(asset, quantity)
             sold_cost += cost
             sold_any = sold_any or consumed > 0
-        if sold_any:
-            proceeds = total_in or notional
+        if sold_any and notional > 0:
+            proceeds = notional
             trade_pnl = proceeds - sold_cost - gas_usd
             realized += trade_pnl
-            cash_in += proceeds
+            if incoming_cash:
+                cash_in += proceeds
             if trade_pnl > 0:
                 wins += 1
             elif trade_pnl < 0:
                 losses += 1
-        for leg in incoming:
+        acquired = [
+            leg
+            for leg in incoming
+            if not is_trusted_quote_asset(str(leg.get("asset", "")))
+        ]
+        priced_total = sum(
+            float(leg.get("usd_value", 0.0) or 0.0) for leg in acquired
+        )
+        for leg in acquired:
             asset = str(leg.get("asset", "")).lower()
-            if asset == NATIVE_ADDRESS or str(leg.get("symbol", "")).upper() in STABLE_SYMBOLS:
-                continue
             quantity = float(leg.get("amount", 0.0) or 0.0)
-            leg_value = float(leg.get("usd_value", 0.0) or 0.0)
-            if leg_value <= 0 and total_in > 0:
-                leg_value = notional / max(len(incoming), 1)
+            market_value = float(leg.get("usd_value", 0.0) or 0.0)
+            weight = (
+                market_value / priced_total
+                if priced_total > 0
+                else 1 / max(len(acquired), 1)
+            )
+            leg_value = (notional + gas_usd) * weight
             symbols[asset] = str(leg.get("symbol", ""))
-            if not sold_any and total_in > 0:
-                leg_value += gas_usd * (leg_value / total_in)
-            add_lot(asset, quantity, leg_value)
-        if not sold_any and gas_usd:
+            decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
+            if notional > 0:
+                add_lot(asset, quantity, leg_value)
+        if outgoing_cash and gas_usd:
             invested += gas_usd
             cash_out += gas_usd
 
@@ -369,7 +595,10 @@ def compute_fifo_pnl(
         market_value = quantity * latest_prices.get(asset, 0.0)
         unrealized += market_value - cost if asset in latest_prices else 0.0
         open_positions[asset] = {
-            "quantity": quantity, "cost_usd": cost, "symbol": symbols.get(asset, "")
+            "quantity": quantity,
+            "cost_usd": cost,
+            "symbol": symbols.get(asset, ""),
+            "decimals": decimals_by_asset.get(asset, 18),
         }
     total = realized + unrealized
     trades = wins + losses
@@ -448,13 +677,22 @@ class FeatureCalculator:
                 NATIVE_ADDRESS, "ETH", 18, row.timestamp, row.block_number
             )
             gas_by_hash[row.tx_hash] = gas_eth * (eth_price or 0.0)
-        swaps = derive_swaps(grouped, resolver, gas_by_hash)
+        events = derive_events(grouped, resolver, gas_by_hash)
+        swaps = [
+            event
+            for event in events
+            if event["event_type"] in TRADE_EVENT_TYPES
+        ]
         pnl = compute_fifo_pnl(swaps)
         latest_prices = {}
         now = int(datetime.now(timezone.utc).timestamp())
         for asset, position in pnl["open_positions"].items():
             price = resolver.resolve(
-                asset, position.get("symbol", ""), 18, now, as_of_block
+                asset,
+                position.get("symbol", ""),
+                int(position.get("decimals", 18)),
+                now,
+                as_of_block,
             )
             if price is not None:
                 latest_prices[asset] = price
@@ -471,7 +709,11 @@ class FeatureCalculator:
         first = min(timestamps) if timestamps else now
         last = max(timestamps) if timestamps else now
         active_days = max((last - first) / 86400, 1.0)
-        trade_values = [float(item.get("usd_value", 0.0)) for item in swaps]
+        trade_values = [
+            float(item.get("usd_value", 0.0))
+            for item in swaps
+            if float(item.get("usd_value", 0.0)) > 0
+        ]
         swap_days = {
             datetime.fromtimestamp(item["timestamp"], timezone.utc).date()
             for item in swaps
@@ -481,7 +723,7 @@ class FeatureCalculator:
             leg["asset"]
             for swap in swaps
             for leg in [*swap["outgoing"], *swap["incoming"]]
-            if leg["asset"] != NATIVE_ADDRESS
+            if asset_kind(str(leg["asset"])) == "token"
         }
         known_prices = sum(
             leg.get("price_usd") is not None
@@ -491,18 +733,26 @@ class FeatureCalculator:
         total_legs = sum(
             len(swap["outgoing"]) + len(swap["incoming"]) for swap in swaps
         )
-        total_out = sum(float(item.get("usd_out", 0.0)) for item in swaps)
-        total_in = sum(float(item.get("usd_in", 0.0)) for item in swaps)
-        total_gas = sum(float(item.get("gas_usd", 0.0)) for item in swaps)
+        total_out = float(pnl["cash_out_usd"])
+        total_in = float(pnl["cash_in_usd"])
+        total_gas = sum(gas_by_hash.values())
         token_volume: dict[str, float] = defaultdict(float)
         stable_volume = 0.0
         for swap in swaps:
-            for leg in [*swap["outgoing"], *swap["incoming"]]:
-                value = float(leg.get("usd_value", 0.0) or 0.0)
-                symbol = str(leg.get("symbol", ""))
-                token_volume[symbol] += value
-                if symbol.upper() in STABLE_SYMBOLS:
-                    stable_volume += value
+            notional = float(swap.get("usd_value", 0.0) or 0.0)
+            token_legs = [
+                leg
+                for leg in [*swap["outgoing"], *swap["incoming"]]
+                if asset_kind(str(leg.get("asset", ""))) == "token"
+            ]
+            symbols = {str(leg.get("symbol", "")) for leg in token_legs}
+            for symbol in symbols:
+                token_volume[symbol] += notional / max(len(symbols), 1)
+            if any(
+                asset_kind(str(leg.get("asset", ""))) == "stable"
+                for leg in [*swap["outgoing"], *swap["incoming"]]
+            ):
+                stable_volume += notional
         token_volume_total = sum(token_volume.values())
         if token_volume:
             top_token_symbol, top_token_volume = max(
@@ -518,7 +768,33 @@ class FeatureCalculator:
             "internal_transaction_count": len(internals),
             "token_transfer_count": len(transfers),
             "native_balance": balance_wei / 10**18,
+            "classified_event_count": len(events),
             "swap_count": len(swaps),
+            "valued_swap_count": len(trade_values),
+            "buy_like_count": sum(
+                item["event_type"] == "buy_like" for item in events
+            ),
+            "sell_like_count": sum(
+                item["event_type"] == "sell_like" for item in events
+            ),
+            "swap_like_count": sum(
+                item["event_type"] == "swap_like" for item in events
+            ),
+            "transfer_in_count": sum(
+                item["event_type"] == "transfer_in" for item in events
+            ),
+            "transfer_out_count": sum(
+                item["event_type"] == "transfer_out" for item in events
+            ),
+            "wrap_or_unwrap_count": sum(
+                item["event_type"] == "wrap_or_unwrap" for item in events
+            ),
+            "liquidity_event_count": sum(
+                item["event_type"] in {
+                    "maybe_liquidity_add", "maybe_liquidity_remove"
+                }
+                for item in events
+            ),
             "multi_leg_swap_count": sum(item["is_multi_leg"] for item in swaps),
             "dex_active_days": len(swap_days),
             "swaps_per_active_day": len(swaps) / len(swap_days) if swap_days else 0.0,
@@ -531,8 +807,8 @@ class FeatureCalculator:
             "total_gas_usd": total_gas,
             "average_gas_per_swap_usd": total_gas / len(swaps) if swaps else 0.0,
             "gas_share_percent": (
-                total_gas * 100 / (total_out + total_in)
-                if total_out + total_in else 0.0
+                total_gas * 100 / sum(trade_values)
+                if trade_values else 0.0
             ),
             "unique_tokens_traded": len(token_assets),
             "top_token_symbol": top_token_symbol,
@@ -549,6 +825,21 @@ class FeatureCalculator:
         quality = {
             "priced_leg_ratio": known_prices / total_legs if total_legs else 1.0,
             "transaction_hash_groups": len(grouped),
+            "reliably_valued_trade_ratio": (
+                len(trade_values) / len(swaps) if swaps else 1.0
+            ),
+            "low_confidence_trade_count": sum(
+                item["valuation_confidence"] in {"low", "none"}
+                for item in swaps
+            ),
+            "max_valuation_divergence": max(
+                (
+                    float(item["valuation_divergence"])
+                    for item in swaps
+                    if item["valuation_divergence"] is not None
+                ),
+                default=0.0,
+            ),
             "open_positions": pnl["open_positions"],
         }
         snapshot = self.session.scalar(

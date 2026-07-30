@@ -8,8 +8,9 @@ from app.config import Settings
 from app.database import Database
 from app.jobs import CollectionJobManager
 from app.key_pool import KeyPool, RateLimitedError
-from app.models import Chain, Job, JobItem, Wallet
+from app.models import Chain, Job, JobItem, Token, Wallet
 from app.providers import ProviderBundle
+from conftest import FakeExplorer, FakePrices, FakeRpc
 
 
 def test_settings_ignore_environment_provider_keys(monkeypatch) -> None:
@@ -83,3 +84,54 @@ def test_missing_provider_keys_fail_item_not_startup(tmp_path) -> None:
         assert item.state == "failed"
         assert "No configured infura API keys" in item.error
     manager.shutdown()
+
+
+def test_collection_prefers_onchain_token_decimals(app_client) -> None:
+    _, database = app_client
+
+    class SixDecimalRpc(FakeRpc):
+        def token_decimals(
+            self, token_address: str, block: int | str = "latest"
+        ) -> int | None:
+            return 6
+
+    providers = ProviderBundle(
+        FakeExplorer(), SixDecimalRpc(), FakePrices(), KeyPool({})
+    )
+    with database.session() as session:
+        chain = session.scalar(select(Chain).where(Chain.slug == "ethereum"))
+        wallet = Wallet(
+            chain_id=chain.id,
+            address="0x0000000000000000000000000000000000000011",
+        )
+        session.add(wallet)
+        session.flush()
+        wallet_id = wallet.id
+
+    CollectionJobManager(database, providers, max_workers=1)._persist_transfers(
+        wallet_id,
+        [
+            {
+                "contractAddress": "0x00000000000000000000000000000000000000aa",
+                "hash": "0xdecimals",
+                "blockNumber": "10",
+                "timeStamp": "100",
+                "from": "0x00000000000000000000000000000000000000bb",
+                "to": "0x0000000000000000000000000000000000000011",
+                "value": str(500 * 10**6),
+                "tokenDecimal": "18",
+                "tokenSymbol": "AAA",
+                "tokenName": "Token A",
+                "logIndex": "0",
+            }
+        ],
+    )
+
+    with database.session() as session:
+        token = session.scalar(
+            select(Token).where(
+                Token.address
+                == "0x00000000000000000000000000000000000000aa"
+            )
+        )
+        assert token.decimals == 6

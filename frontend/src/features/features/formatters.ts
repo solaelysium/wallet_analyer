@@ -3,6 +3,7 @@ import type { FeatureColumn } from '../../api/types'
 export function formatFeatureValue(
   value: string | number | boolean | null,
   type: FeatureColumn['type'],
+  columnId?: string,
 ): string {
   if (value === null || value === '') return '—'
   if (type === 'boolean') return value ? 'Да' : 'Нет'
@@ -14,7 +15,8 @@ export function formatFeatureValue(
     return new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value)
   }
   if (type === 'percent' && typeof value === 'number') {
-    return new Intl.NumberFormat('ru-RU', { style: 'percent', maximumFractionDigits: 2 }).format(value)
+    const ratio = columnId?.endsWith('_percent') ? value / 100 : value
+    return new Intl.NumberFormat('ru-RU', { style: 'percent', maximumFractionDigits: 2 }).format(ratio)
   }
   if (type === 'number' && typeof value === 'number') {
     return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 6 }).format(value)

@@ -18,6 +18,7 @@ from .models import (
 )
 from .providers import ProviderBundle
 from .repositories import JobRepository, TokenRepository, log_event, sqlite_upsert
+from .token_rules import STABLECOINS, canonical_decimals
 
 
 class JobCancelled(RuntimeError):
@@ -363,17 +364,39 @@ class CollectionJobManager:
         with self.database.session() as session:
             wallet = session.get(Wallet, wallet_id)
             tokens = TokenRepository(session)
+            decimals_cache: dict[str, int] = {}
             for index, row in enumerate(rows):
                 token_address = str(row.get("contractAddress", "")).lower()
                 tx_hash = str(row.get("hash", "")).lower()
                 if not token_address or not tx_hash:
                     continue
+                block_number = safe_int(row.get("blockNumber"))
+                if token_address not in decimals_cache:
+                    decimals = canonical_decimals(token_address)
+                    if decimals is None:
+                        try:
+                            decimals = self.providers.rpc.token_decimals(
+                                token_address, block_number or "latest"
+                            )
+                        except Exception:
+                            decimals = None
+                    reported_decimals = safe_int(row.get("tokenDecimal"), -1)
+                    if decimals is None:
+                        decimals = (
+                            reported_decimals
+                            if 0 <= reported_decimals <= 255
+                            else 18
+                        )
+                    decimals_cache[token_address] = decimals
+                stable_metadata = STABLECOINS.get(token_address)
                 token = tokens.get_or_create(
                     wallet.chain_id,
                     token_address,
-                    str(row.get("tokenSymbol", "")) or None,
+                    stable_metadata[0] if stable_metadata else (
+                        str(row.get("tokenSymbol", "")) or None
+                    ),
                     str(row.get("tokenName", "")) or None,
-                    safe_int(row.get("tokenDecimal"), 18),
+                    decimals_cache[token_address],
                 )
                 values = {
                     "chain_id": wallet.chain_id,
@@ -383,7 +406,7 @@ class CollectionJobManager:
                     "log_index": safe_int(
                         row.get("logIndex", row.get("transactionIndex", index))
                     ),
-                    "block_number": safe_int(row.get("blockNumber")),
+                    "block_number": block_number,
                     "timestamp": safe_int(row.get("timeStamp")),
                     "from_address": str(row.get("from", "")).lower(),
                     "to_address": str(row.get("to", "")).lower(),

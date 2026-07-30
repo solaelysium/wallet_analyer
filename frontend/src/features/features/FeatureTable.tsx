@@ -52,7 +52,11 @@ export function FeatureTable({
         id: column.id,
         accessorFn: (row) => row[column.id],
         header: column.label,
-        cell: (info) => formatFeatureValue(info.getValue() as FeatureRow[string], column.type),
+        cell: (info) => formatFeatureValue(
+          info.getValue() as FeatureRow[string],
+          column.type,
+          column.id,
+        ),
         enableSorting: column.source !== 'quality',
       })),
     [schema],

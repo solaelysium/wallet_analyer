@@ -14,7 +14,7 @@ from app.models import Chain, ClusterAssignment, ClusterRun, Wallet, WalletFeatu
 def test_cluster_parameters_are_validated() -> None:
     request = ClusterRequest(algorithm="kmeans", reducer="pca", n_clusters=2)
     assert request.n_clusters == 2
-    assert request.feature_version == "wallet_features.v2"
+    assert request.feature_version == "wallet_features.v3"
 
 
 def test_kmeans_worker_returns_coordinates_and_metrics() -> None:
@@ -69,7 +69,7 @@ def test_ml_manager_uses_spawned_process_and_persists_results(tmp_path) -> None:
             session.add(
                 WalletFeatureSnapshot(
                     wallet_id=wallet.id,
-                        version="wallet_features.v2",
+                        version="wallet_features.v3",
                     as_of_block=1,
                     features={
                         "activity": float(index // 3 * 10 + index % 3 / 10),

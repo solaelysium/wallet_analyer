@@ -108,7 +108,7 @@ def test_recalculate_reprocesses_completed_wallets(app_client) -> None:
     detail = client.get(f"/api/jobs/{job_id}").json()
     assert detail["items"][0]["attempts"] == 2
     assert client.get("/api/features").json()["items"][0]["version"] == (
-        "wallet_features.v2"
+            "wallet_features.v3"
     )
 
 
