@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from app.models import ApiKey, Wallet, WalletImport
+from app.models import ApiKey, Chain, Wallet, WalletImport, WalletImportMember
 
 
 ADDRESS_A = "0x0000000000000000000000000000000000000001"
@@ -73,6 +74,59 @@ def test_preview_does_not_persist(app_client) -> None:
     with database.session() as session:
         assert session.scalar(select(Wallet.id)) is None
         assert session.scalar(select(WalletImport.id)) is None
+
+
+def test_preview_marks_analyzed_wallet_and_confirmation_can_exclude_it(
+    app_client,
+) -> None:
+    client, database = app_client
+    analyzed_at = datetime(2026, 7, 30, 12, 30, tzinfo=timezone.utc)
+    with database.session() as session:
+        chain = session.scalar(select(Chain).where(Chain.slug == "ethereum"))
+        session.add(
+            Wallet(
+                chain_id=chain.id,
+                address=ADDRESS_A,
+                checksum_address=ADDRESS_A,
+                last_collected_at=analyzed_at,
+            )
+        )
+
+    preview = client.post(
+        "/api/imports/preview",
+        data={"manual_text": f"{ADDRESS_A}\n{ADDRESS_B}", "chain": "ethereum"},
+    )
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["analyzed_count"] == 1
+    existing = next(
+        entry for entry in payload["entries"] if entry["address"] == ADDRESS_A
+    )
+    assert existing["already_analyzed"] is True
+    assert existing["last_analyzed_at"].startswith("2026-07-30T12:30")
+
+    confirmed = client.post(
+        "/api/imports/confirm",
+        json={
+            "token": payload["token"],
+            "name": "Only new wallets",
+            "chain": "ethereum",
+            "excluded_addresses": [ADDRESS_A],
+        },
+    )
+    assert confirmed.status_code == 201
+    assert confirmed.json()["job"]["progress_total"] == 1
+    with database.session() as session:
+        batch = session.scalar(
+            select(WalletImport).where(WalletImport.name == "Only new wallets")
+        )
+        member = session.scalar(
+            select(WalletImportMember).where(
+                WalletImportMember.wallet_import_id == batch.id
+            )
+        )
+        wallet = session.get(Wallet, member.wallet_id)
+        assert wallet.address == ADDRESS_B
 
 
 def test_tabular_import_rejects_extra_columns(app_client) -> None:

@@ -61,6 +61,14 @@ class OnchainPrices:
     ) -> float:
         return 12.5
 
+    def token_balance(
+        self,
+        token_address: str,
+        wallet_address: str,
+        block: int | str = "latest",
+    ) -> int:
+        return 10**18
+
 
 def test_transaction_hash_grouping_detects_multi_leg_swap() -> None:
     grouped = {
@@ -83,6 +91,8 @@ def test_fifo_pnl_consumes_oldest_lot_proportionally() -> None:
         {
             "tx_hash": "buy",
             "timestamp": 1,
+            "event_type": "buy_like",
+            "usd_value": 100.0,
             "usd_out": 100.0,
             "usd_in": 100.0,
             "outgoing": [
@@ -105,6 +115,8 @@ def test_fifo_pnl_consumes_oldest_lot_proportionally() -> None:
         {
             "tx_hash": "sell",
             "timestamp": 2,
+            "event_type": "sell_like",
+            "usd_value": 60.0,
             "usd_out": 60.0,
             "usd_in": 60.0,
             "outgoing": [
@@ -125,12 +137,16 @@ def test_fifo_pnl_consumes_oldest_lot_proportionally() -> None:
             ],
         },
     ]
-    result = compute_fifo_pnl(swaps)
+    result = compute_fifo_pnl(
+        swaps, {TOKEN_A: 10.0}, {TOKEN_A: 6.0}
+    )
     assert result["realized_pnl_usd"] == pytest.approx(20.0)
-    assert result["invested_usd"] == pytest.approx(100.0)
+    assert result["gross_buy_spend_usd"] == pytest.approx(100.0)
     assert result["open_positions"][TOKEN_A]["quantity"] == pytest.approx(6.0)
-    assert result["open_positions"][TOKEN_A]["cost_usd"] == pytest.approx(60.0)
-    marked = compute_fifo_pnl(swaps, {TOKEN_A: 20.0})
+    assert result["open_positions"][TOKEN_A]["known_cost_usd"] == pytest.approx(60.0)
+    marked = compute_fifo_pnl(
+        swaps, {TOKEN_A: 20.0}, {TOKEN_A: 6.0}
+    )
     assert marked["unrealized_pnl_usd"] == pytest.approx(60.0)
 
 
@@ -138,21 +154,23 @@ def test_fifo_gas_is_counted_once_in_cost_and_realized_pnl() -> None:
     swaps = [
         {
             "tx_hash": "buy", "timestamp": 1, "usd_out": 100.0, "usd_in": 100.0,
+            "event_type": "buy_like", "usd_value": 100.0,
             "gas_usd": 2.0,
             "outgoing": [{"asset": NATIVE_ADDRESS, "symbol": "ETH", "amount": 1, "usd_value": 100.0}],
             "incoming": [{"asset": TOKEN_A, "symbol": "AAA", "amount": 10, "usd_value": 100.0}],
         },
         {
             "tx_hash": "sell", "timestamp": 2, "usd_out": 120.0, "usd_in": 120.0,
+            "event_type": "sell_like", "usd_value": 120.0,
             "gas_usd": 3.0,
             "outgoing": [{"asset": TOKEN_A, "symbol": "AAA", "amount": 10, "usd_value": 120.0}],
             "incoming": [{"asset": NATIVE_ADDRESS, "symbol": "ETH", "amount": 1, "usd_value": 120.0}],
         },
     ]
     result = compute_fifo_pnl(swaps)
-    assert result["invested_usd"] == pytest.approx(102.0)
+    assert result["gross_buy_spend_usd"] == pytest.approx(102.0)
     assert result["realized_pnl_usd"] == pytest.approx(15.0)
-    assert result["total_gas_usd"] == pytest.approx(5.0)
+    assert result["total_trade_gas_usd"] == pytest.approx(5.0)
 
 
 def test_price_resolver_uses_and_caches_onchain_fallback(app_client) -> None:
@@ -252,6 +270,12 @@ def test_suspicious_symbols_and_failed_transactions_are_excluded(app_client) -> 
         assert snapshot.version == FEATURE_VERSION
         assert snapshot.features["token_transfer_count"] == 1
         assert snapshot.features["normal_transaction_count"] == 0
+        assert snapshot.features["token_trade_count"] == 0
+        assert snapshot.features["gross_buy_spend_usd"] == 0
+        assert snapshot.features["realized_pnl_usd"] is None
+        assert snapshot.quality["pnl_valid"] is False
+        assert snapshot.quality["unknown_open_position_count"] == 1
+        assert snapshot.quality["inventory_reconciliation_ratio"] == 1
         assert snapshot.quality["transaction_hash_groups"] == 1
 
 
@@ -342,3 +366,155 @@ def test_stablecoin_identity_uses_contract_address_not_symbol() -> None:
     official_usdc = next(iter(STABLECOINS))
     assert asset_kind(official_usdc) == "stable"
     assert asset_kind(TOKEN_A) == "token"
+
+
+def test_transfer_out_removes_fifo_inventory_without_realizing_pnl() -> None:
+    events = [
+        {
+            "tx_hash": "buy",
+            "timestamp": 1,
+            "event_type": "buy_like",
+            "usd_value": 100.0,
+            "gas_usd": 1.0,
+            "outgoing": [
+                {"asset": NATIVE_ADDRESS, "symbol": "ETH", "amount": 1}
+            ],
+            "incoming": [
+                {
+                    "asset": TOKEN_A,
+                    "symbol": "AAA",
+                    "decimals": 18,
+                    "amount": 10.0,
+                    "usd_value": 100.0,
+                }
+            ],
+        },
+        {
+            "tx_hash": "transfer",
+            "timestamp": 2,
+            "event_type": "transfer_out",
+            "usd_value": 0.0,
+            "gas_usd": 0.5,
+            "outgoing": [
+                {
+                    "asset": TOKEN_A,
+                    "symbol": "AAA",
+                    "decimals": 18,
+                    "amount": 10.0,
+                }
+            ],
+            "incoming": [],
+        },
+    ]
+
+    result = compute_fifo_pnl(events)
+
+    assert result["open_positions"] == {}
+    assert result["pnl_valid"] is True
+    assert result["realized_pnl_usd"] == pytest.approx(0.0)
+    assert result["gross_buy_spend_usd"] == pytest.approx(101.0)
+
+
+def test_unknown_transfer_basis_suppresses_all_pnl_metrics() -> None:
+    events = [
+        {
+            "tx_hash": "deposit",
+            "timestamp": 1,
+            "event_type": "transfer_in",
+            "usd_value": 0.0,
+            "gas_usd": 0.0,
+            "outgoing": [],
+            "incoming": [
+                {
+                    "asset": TOKEN_A,
+                    "symbol": "AAA",
+                    "decimals": 18,
+                    "amount": 10.0,
+                }
+            ],
+        },
+        {
+            "tx_hash": "sell",
+            "timestamp": 2,
+            "event_type": "sell_like",
+            "usd_value": 120.0,
+            "gas_usd": 2.0,
+            "outgoing": [
+                {
+                    "asset": TOKEN_A,
+                    "symbol": "AAA",
+                    "decimals": 18,
+                    "amount": 10.0,
+                }
+            ],
+            "incoming": [
+                {"asset": NATIVE_ADDRESS, "symbol": "ETH", "amount": 1}
+            ],
+        },
+    ]
+
+    result = compute_fifo_pnl(events)
+
+    assert result["pnl_basis_coverage_ratio"] == pytest.approx(0.0)
+    assert result["unknown_basis_sale_count"] == 1
+    assert result["gross_sell_proceeds_usd"] == pytest.approx(120.0)
+    assert result["realized_pnl_usd"] is None
+    assert result["total_pnl_usd"] is None
+    assert result["roi"] is None
+    assert result["winrate"] is None
+
+
+def test_inventory_mismatch_suppresses_pnl() -> None:
+    event = {
+        "tx_hash": "buy",
+        "timestamp": 1,
+        "event_type": "buy_like",
+        "usd_value": 100.0,
+        "gas_usd": 1.0,
+        "outgoing": [
+            {"asset": NATIVE_ADDRESS, "symbol": "ETH", "amount": 1}
+        ],
+        "incoming": [
+            {
+                "asset": TOKEN_A,
+                "symbol": "AAA",
+                "decimals": 18,
+                "amount": 10.0,
+                "usd_value": 100.0,
+            }
+        ],
+    }
+
+    result = compute_fifo_pnl(
+        [event], {TOKEN_A: 12.0}, {TOKEN_A: 0.0}
+    )
+
+    assert result["inventory_mismatch_count"] == 1
+    assert result["inventory_reconciliation_ratio"] == pytest.approx(0.0)
+    assert result["pnl_valid"] is False
+    assert result["unrealized_pnl_usd"] is None
+
+
+def test_cash_conversion_is_not_counted_as_token_investment() -> None:
+    usdc = next(iter(STABLECOINS))
+    event = {
+        "tx_hash": "cash",
+        "timestamp": 1,
+        "event_type": "swap_like",
+        "usd_value": 1000.0,
+        "gas_usd": 2.0,
+        "outgoing": [
+            {"asset": NATIVE_ADDRESS, "symbol": "ETH", "amount": 0.4}
+        ],
+        "incoming": [
+            {"asset": usdc, "symbol": "USDC", "amount": 995.0}
+        ],
+    }
+
+    result = compute_fifo_pnl([event])
+
+    assert result["cash_conversion_count"] == 1
+    assert result["cash_conversion_volume_usd"] == pytest.approx(1000.0)
+    assert result["token_trade_count"] == 0
+    assert result["gross_buy_spend_usd"] == pytest.approx(0.0)
+    assert result["gross_sell_proceeds_usd"] == pytest.approx(0.0)

@@ -223,12 +223,16 @@ async def imports_preview(
     request: Request,
     files: list[UploadFile] = File(default=[]),
     manual_text: str = Form(default=""),
+    chain: str = Form(default="ethereum"),
+    session: Session = Depends(get_session),
 ) -> dict:
     try:
         result = await preview_import(
+            session,
             files,
             manual_text,
             SecretBox(request.app.state.settings.app_secret_key),
+            chain,
         )
         return result.model_dump()
     except ValueError as exc:
@@ -892,14 +896,22 @@ def _feature_rows(
                 and (maximum is None or row["features"][name] <= maximum)
             ]
 
-    def sort_value(row: dict):
+    def raw_sort_value(row: dict):
         if sort_by in {"address", "created_at", "as_of_block", "version"}:
-            value = row[sort_by]
-        else:
-            value = row["features"].get(sort_by)
-        return (value is None, value if isinstance(value, (int, float, str)) else str(value))
+            return row[sort_by]
+        return row["features"].get(sort_by)
 
-    rows.sort(key=sort_value, reverse=sort_order == "desc")
+    present = [row for row in rows if raw_sort_value(row) is not None]
+    missing = [row for row in rows if raw_sort_value(row) is None]
+    present.sort(
+        key=lambda row: (
+            raw_sort_value(row)
+            if isinstance(raw_sort_value(row), (int, float, str))
+            else str(raw_sort_value(row))
+        ),
+        reverse=sort_order == "desc",
+    )
+    rows = present + missing
     return rows
 
 

@@ -28,6 +28,7 @@ export function WalletsPage() {
   const [manual, setManual] = useState('')
   const [importError, setImportError] = useState('')
   const [preview, setPreview] = useState<WalletPreview | null>(null)
+  const [excludedAddresses, setExcludedAddresses] = useState<Set<string>>(new Set())
   const [batchName, setBatchName] = useState(`Пакет кошельков ${new Date().toLocaleDateString('ru-RU')}`)
   const [chain, setChain] = useState('ethereum')
   const [logJob, setLogJob] = useState<Job | null>(null)
@@ -46,14 +47,24 @@ export function WalletsPage() {
       previewWalletSources(
         sources.flatMap((source) => (source.file ? [source.file] : [])),
         sources.filter((source) => source.kind === 'manual').map((source) => source.raw).join('\n'),
+        chain,
       ),
-    onSuccess: setPreview,
+    onSuccess: (result) => {
+      setExcludedAddresses(new Set())
+      setPreview(result)
+    },
   })
 
   const createMutation = useMutation({
-    mutationFn: () => createWalletBatch(preview?.token ?? '', batchName.trim(), chain),
+    mutationFn: () => createWalletBatch(
+      preview?.token ?? '',
+      batchName.trim(),
+      chain,
+      Array.from(excludedAddresses),
+    ),
     onSuccess: () => {
       setPreview(null)
+      setExcludedAddresses(new Set())
       setSources([])
       void queryClient.invalidateQueries({ queryKey: ['wallet-jobs'] })
     },
@@ -76,6 +87,15 @@ export function WalletsPage() {
     if (job.importId === null) return
     deleteMutation.reset()
     setDeleteJob(job)
+  }
+
+  function togglePreviewAddress(address: string) {
+    setExcludedAddresses((current) => {
+      const next = new Set(current)
+      if (next.has(address)) next.delete(address)
+      else next.add(address)
+      return next
+    })
   }
 
   async function addFiles(files: FileList | null) {
@@ -215,8 +235,19 @@ export function WalletsPage() {
         chain={chain}
         onBatchNameChange={setBatchName}
         onChainChange={setChain}
-        onClose={() => setPreview(null)}
+        onClose={() => {
+          setPreview(null)
+          setExcludedAddresses(new Set())
+        }}
         onConfirm={() => createMutation.mutate()}
+        excludedAddresses={excludedAddresses}
+        onToggleAddress={togglePreviewAddress}
+        onSelectAll={() => setExcludedAddresses(new Set())}
+        onSelectOnlyNew={() => setExcludedAddresses(new Set(
+          preview?.entries
+            .filter((entry) => entry.alreadyAnalyzed)
+            .map((entry) => entry.address) ?? [],
+        ))}
         confirming={createMutation.isPending}
         confirmError={createMutation.error?.message}
       />

@@ -17,4 +17,9 @@ describe('formatFeatureValue', () => {
   it('still converts ratio values to percentages', () => {
     expect(formatFeatureValue(0.2953, 'percent', 'winrate')).toContain('29,53')
   })
+
+  it('renders unavailable strict financial metrics as a dash', () => {
+    expect(formatFeatureValue(null, 'currency', 'realized_pnl_usd')).toBe('—')
+    expect(formatFeatureValue(null, 'percent', 'roi')).toBe('—')
+  })
 })

@@ -13,6 +13,8 @@ export interface PreviewEntry {
   source: string
   row: number
   sourceIndex: string | null
+  alreadyAnalyzed: boolean
+  lastAnalyzedAt: string | null
 }
 
 export interface ImportIssue {
@@ -28,6 +30,7 @@ export interface WalletPreview {
   validCount: number
   duplicateCount: number
   invalidCount: number
+  analyzedCount: number
   sourceCount: number
   entries: PreviewEntry[]
   issues: ImportIssue[]

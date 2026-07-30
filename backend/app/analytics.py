@@ -31,7 +31,7 @@ from .token_rules import (
 )
 
 
-FEATURE_VERSION = "wallet_features.v3"
+FEATURE_VERSION = "wallet_features.v4"
 TRADE_EVENT_TYPES = {"buy_like", "sell_like", "swap_like"}
 
 
@@ -474,146 +474,309 @@ def derive_swaps(
     ]
 
 
+def is_cash_conversion_event(event: dict) -> bool:
+    legs = [*event.get("outgoing", []), *event.get("incoming", [])]
+    return (
+        event.get("event_type") == "swap_like"
+        and bool(legs)
+        and all(is_trusted_quote_asset(str(leg.get("asset", ""))) for leg in legs)
+    )
+
+
+def is_token_trade_event(event: dict) -> bool:
+    if event.get("event_type") in {"buy_like", "sell_like"}:
+        return True
+    if event.get("event_type") != "swap_like":
+        return False
+    return any(
+        asset_kind(str(leg.get("asset", ""))) == "token"
+        for leg in [*event.get("outgoing", []), *event.get("incoming", [])]
+    )
+
+
 def compute_fifo_pnl(
-    swaps: list[dict],
+    events: list[dict],
     latest_prices: dict[str, float] | None = None,
+    current_balances: dict[str, float | None] | None = None,
 ) -> dict:
     latest_prices = latest_prices or {}
+    current_balances = current_balances or {}
     lots: dict[str, deque] = defaultdict(deque)
-    realized = 0.0
-    invested = 0.0
-    cash_in = 0.0
-    cash_out = 0.0
-    total_gas = 0.0
+    known_realized = 0.0
+    covered_sale_notional = 0.0
+    total_sale_notional = 0.0
+    gross_buy_spend = 0.0
+    gross_sell_proceeds = 0.0
+    token_trade_volume = 0.0
+    cash_conversion_volume = 0.0
+    token_trade_gas = 0.0
+    token_trade_count = 0
+    cash_conversion_count = 0
+    unknown_basis_sale_count = 0
+    unknown_inventory_outflow_count = 0
     wins = 0
     losses = 0
     symbols: dict[str, str] = {}
     decimals_by_asset: dict[str, int] = {}
 
-    def add_lot(asset: str, quantity: float, cost: float) -> None:
-        if quantity > 0 and cost >= 0:
-            lots[asset].append([quantity, cost])
+    def add_lot(asset: str, quantity: float, cost: float | None) -> None:
+        if quantity > 1e-15:
+            lots[asset].append(
+                {"quantity": quantity, "cost_usd": cost}
+            )
 
-    def consume(asset: str, quantity: float) -> tuple[float, float]:
+    def consume(asset: str, quantity: float) -> dict:
         remaining = max(quantity, 0.0)
-        cost = 0.0
-        consumed = 0.0
+        known_cost = 0.0
+        known_quantity = 0.0
+        unknown_quantity = 0.0
         queue = lots[asset]
         while remaining > 1e-15 and queue:
-            lot_quantity, lot_cost = queue[0]
+            lot = queue[0]
+            lot_quantity = float(lot["quantity"])
+            lot_cost = lot["cost_usd"]
             take = min(remaining, lot_quantity)
             fraction = take / lot_quantity
-            allocated = lot_cost * fraction
-            cost += allocated
-            consumed += take
+            if lot_cost is None:
+                allocated = None
+                unknown_quantity += take
+            else:
+                allocated = float(lot_cost) * fraction
+                known_cost += allocated
+                known_quantity += take
             remaining -= take
             if take >= lot_quantity - 1e-15:
                 queue.popleft()
             else:
-                queue[0] = [lot_quantity - take, lot_cost - allocated]
-        return cost, consumed
+                lot["quantity"] = lot_quantity - take
+                if allocated is not None:
+                    lot["cost_usd"] = float(lot_cost) - allocated
+        if remaining > 1e-15:
+            unknown_quantity += remaining
+        return {
+            "known_cost_usd": known_cost,
+            "known_quantity": known_quantity,
+            "unknown_quantity": unknown_quantity,
+            "requested_quantity": max(quantity, 0.0),
+        }
 
-    for swap in sorted(swaps, key=lambda item: (item.get("timestamp", 0), item.get("tx_hash", ""))):
-        outgoing = swap.get("outgoing", [])
-        incoming = swap.get("incoming", [])
+    ordered_events = sorted(
+        events,
+        key=lambda item: (item.get("timestamp", 0), item.get("tx_hash", "")),
+    )
+    for event in ordered_events:
+        outgoing = event.get("outgoing", [])
+        incoming = event.get("incoming", [])
         notional = float(
-            swap.get(
+            event.get(
                 "usd_value",
                 max(
-                    float(swap.get("usd_out", 0.0) or 0.0),
-                    float(swap.get("usd_in", 0.0) or 0.0),
+                    float(event.get("usd_out", 0.0) or 0.0),
+                    float(event.get("usd_in", 0.0) or 0.0),
                 ),
             )
             or 0.0
         )
-        gas_usd = float(swap.get("gas_usd", 0.0) or 0.0)
-        total_gas += gas_usd
-        outgoing_cash = any(
-            is_trusted_quote_asset(str(leg.get("asset", "")))
+        gas_usd = float(event.get("gas_usd", 0.0) or 0.0)
+        token_trade = is_token_trade_event(event)
+        cash_conversion = is_cash_conversion_event(event)
+        if token_trade:
+            token_trade_count += 1
+            token_trade_volume += notional
+            token_trade_gas += gas_usd
+        if cash_conversion:
+            cash_conversion_count += 1
+            cash_conversion_volume += notional
+        if event.get("event_type") == "buy_like":
+            gross_buy_spend += notional + gas_usd
+        if event.get("event_type") == "sell_like":
+            gross_sell_proceeds += notional
+
+        outgoing_tokens = [
+            leg
             for leg in outgoing
-        )
-        incoming_cash = any(
-            is_trusted_quote_asset(str(leg.get("asset", "")))
-            for leg in incoming
-        )
-        if outgoing_cash and notional > 0:
-            invested += notional
-            cash_out += notional
-        sold_cost = 0.0
-        sold_any = False
-        for leg in outgoing:
-            asset = str(leg.get("asset", "")).lower()
-            quantity = float(leg.get("amount", 0.0) or 0.0)
-            if is_trusted_quote_asset(asset):
-                continue
-            symbols[asset] = str(leg.get("symbol", ""))
-            decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
-            cost, consumed = consume(asset, quantity)
-            sold_cost += cost
-            sold_any = sold_any or consumed > 0
-        if sold_any and notional > 0:
-            proceeds = notional
-            trade_pnl = proceeds - sold_cost - gas_usd
-            realized += trade_pnl
-            if incoming_cash:
-                cash_in += proceeds
-            if trade_pnl > 0:
-                wins += 1
-            elif trade_pnl < 0:
-                losses += 1
-        acquired = [
+            if asset_kind(str(leg.get("asset", ""))) == "token"
+        ]
+        incoming_tokens = [
             leg
             for leg in incoming
-            if not is_trusted_quote_asset(str(leg.get("asset", "")))
+            if asset_kind(str(leg.get("asset", ""))) == "token"
         ]
+        consumed_rows = []
+        for leg in outgoing_tokens:
+            asset = str(leg.get("asset", "")).lower()
+            quantity = float(leg.get("amount", 0.0) or 0.0)
+            symbols[asset] = str(leg.get("symbol", ""))
+            decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
+            result = consume(asset, quantity)
+            consumed_rows.append(result)
+            if result["unknown_quantity"] > 1e-15 and not token_trade:
+                unknown_inventory_outflow_count += 1
+
+        if token_trade and outgoing_tokens:
+            sold_quantity = sum(
+                row["requested_quantity"] for row in consumed_rows
+            )
+            known_quantity = sum(
+                row["known_quantity"] for row in consumed_rows
+            )
+            known_cost = sum(
+                row["known_cost_usd"] for row in consumed_rows
+            )
+            coverage = (
+                min(known_quantity / sold_quantity, 1.0)
+                if sold_quantity > 1e-15
+                else 0.0
+            )
+            total_sale_notional += notional
+            covered_sale_notional += notional * coverage
+            known_trade_pnl = (
+                notional * coverage - known_cost - gas_usd * coverage
+            )
+            known_realized += known_trade_pnl
+            if coverage < 1.0 - 1e-12:
+                unknown_basis_sale_count += 1
+            else:
+                if known_trade_pnl > 0:
+                    wins += 1
+                elif known_trade_pnl < 0:
+                    losses += 1
+
         priced_total = sum(
-            float(leg.get("usd_value", 0.0) or 0.0) for leg in acquired
+            float(leg.get("usd_value", 0.0) or 0.0)
+            for leg in incoming_tokens
         )
-        for leg in acquired:
+        known_acquisition = (
+            event.get("event_type") == "buy_like"
+            or (
+                event.get("event_type") == "swap_like"
+                and bool(outgoing_tokens)
+            )
+        )
+        for leg in incoming_tokens:
             asset = str(leg.get("asset", "")).lower()
             quantity = float(leg.get("amount", 0.0) or 0.0)
             market_value = float(leg.get("usd_value", 0.0) or 0.0)
             weight = (
                 market_value / priced_total
                 if priced_total > 0
-                else 1 / max(len(acquired), 1)
+                else 1 / max(len(incoming_tokens), 1)
             )
-            leg_value = (notional + gas_usd) * weight
             symbols[asset] = str(leg.get("symbol", ""))
             decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
-            if notional > 0:
-                add_lot(asset, quantity, leg_value)
-        if outgoing_cash and gas_usd:
-            invested += gas_usd
-            cash_out += gas_usd
+            cost = (
+                (notional + gas_usd) * weight
+                if known_acquisition and notional > 0
+                else None
+            )
+            add_lot(asset, quantity, cost)
 
-    unrealized = 0.0
     open_positions = {}
+    inventory_matched = 0
+    inventory_mismatch_count = 0
+    unknown_open_position_count = 0
+    unpriced_open_position_count = 0
+    unrealized = 0.0
     for asset, queue in lots.items():
-        quantity = sum(lot[0] for lot in queue)
-        cost = sum(lot[1] for lot in queue)
-        market_value = quantity * latest_prices.get(asset, 0.0)
-        unrealized += market_value - cost if asset in latest_prices else 0.0
+        quantity = sum(float(lot["quantity"]) for lot in queue)
+        if quantity <= 1e-12:
+            continue
+        known_cost = sum(
+            float(lot["cost_usd"])
+            for lot in queue
+            if lot["cost_usd"] is not None
+        )
+        unknown_quantity = sum(
+            float(lot["quantity"])
+            for lot in queue
+            if lot["cost_usd"] is None
+        )
+        if unknown_quantity > 1e-12:
+            unknown_open_position_count += 1
+        price = latest_prices.get(asset)
+        if price is None:
+            unpriced_open_position_count += 1
+        elif unknown_quantity <= 1e-12:
+            unrealized += quantity * price - known_cost
+        actual_balance = current_balances.get(asset)
+        if asset in current_balances:
+            tolerance = max(
+                10 ** (-min(decimals_by_asset.get(asset, 18), 12)),
+                abs(actual_balance or 0.0) * 1e-9,
+            )
+            if (
+                actual_balance is not None
+                and abs(quantity - actual_balance) <= tolerance
+            ):
+                inventory_matched += 1
+            else:
+                inventory_mismatch_count += 1
+        else:
+            inventory_mismatch_count += 1
         open_positions[asset] = {
             "quantity": quantity,
-            "cost_usd": cost,
+            "known_cost_usd": known_cost,
+            "unknown_quantity": unknown_quantity,
             "symbol": symbols.get(asset, ""),
             "decimals": decimals_by_asset.get(asset, 18),
+            "onchain_quantity": actual_balance,
         }
-    total = realized + unrealized
-    trades = wins + losses
+
+    basis_coverage = (
+        covered_sale_notional / total_sale_notional
+        if total_sale_notional > 0
+        else 1.0
+    )
+    reconciliation_ratio = (
+        inventory_matched / len(open_positions)
+        if open_positions
+        else 1.0
+    )
+    pnl_valid = (
+        basis_coverage >= 1.0 - 1e-12
+        and inventory_mismatch_count == 0
+        and unknown_open_position_count == 0
+        and unpriced_open_position_count == 0
+    )
+    total = known_realized + unrealized if pnl_valid else None
+    resolved_trades = wins + losses
     return {
-        "realized_pnl_usd": realized,
-        "unrealized_pnl_usd": unrealized,
+        "realized_pnl_usd": known_realized if pnl_valid else None,
+        "unrealized_pnl_usd": unrealized if pnl_valid else None,
         "total_pnl_usd": total,
-        "roi": total / invested if invested else 0.0,
-        "invested_usd": invested,
-        "cash_out_usd": cash_out,
-        "cash_in_usd": cash_in,
-        "total_gas_usd": total_gas,
-        "wins": wins,
-        "losses": losses,
-        "winrate": wins / trades if trades else 0.0,
+        "roi": (
+            total / gross_buy_spend
+            if pnl_valid and gross_buy_spend and total is not None
+            else 0.0 if pnl_valid else None
+        ),
+        "wins": wins if pnl_valid else None,
+        "losses": losses if pnl_valid else None,
+        "winrate": (
+            wins / resolved_trades
+            if pnl_valid and resolved_trades
+            else 0.0 if pnl_valid else None
+        ),
+        "gross_buy_spend_usd": gross_buy_spend,
+        "gross_sell_proceeds_usd": gross_sell_proceeds,
+        "net_cash_deployed_usd": (
+            gross_buy_spend - gross_sell_proceeds
+        ),
+        "token_trade_count": token_trade_count,
+        "total_token_trade_volume_usd": token_trade_volume,
+        "cash_conversion_count": cash_conversion_count,
+        "cash_conversion_volume_usd": cash_conversion_volume,
+        "total_trade_gas_usd": token_trade_gas,
+        "known_realized_pnl_usd": known_realized,
+        "pnl_basis_coverage_ratio": basis_coverage,
+        "inventory_reconciliation_ratio": reconciliation_ratio,
+        "unknown_basis_sale_count": unknown_basis_sale_count,
+        "unknown_inventory_outflow_count": (
+            unknown_inventory_outflow_count
+        ),
+        "inventory_mismatch_count": inventory_mismatch_count,
+        "unknown_open_position_count": unknown_open_position_count,
+        "unpriced_open_position_count": unpriced_open_position_count,
+        "pnl_valid": pnl_valid,
         "open_positions": open_positions,
     }
 
@@ -678,13 +841,19 @@ class FeatureCalculator:
             )
             gas_by_hash[row.tx_hash] = gas_eth * (eth_price or 0.0)
         events = derive_events(grouped, resolver, gas_by_hash)
-        swaps = [
+        token_trades = [
             event
             for event in events
-            if event["event_type"] in TRADE_EVENT_TYPES
+            if is_token_trade_event(event)
         ]
-        pnl = compute_fifo_pnl(swaps)
+        cash_conversions = [
+            event
+            for event in events
+            if is_cash_conversion_event(event)
+        ]
+        pnl = compute_fifo_pnl(events)
         latest_prices = {}
+        current_balances: dict[str, float | None] = {}
         now = int(datetime.now(timezone.utc).timestamp())
         for asset, position in pnl["open_positions"].items():
             price = resolver.resolve(
@@ -696,7 +865,17 @@ class FeatureCalculator:
             )
             if price is not None:
                 latest_prices[asset] = price
-        pnl = compute_fifo_pnl(swaps, latest_prices)
+            raw_balance = self.rpc_provider.token_balance(
+                asset, wallet.address, as_of_block
+            )
+            current_balances[asset] = (
+                raw_balance / 10 ** int(position.get("decimals", 18))
+                if raw_balance is not None
+                else None
+            )
+        pnl = compute_fifo_pnl(
+            events, latest_prices, current_balances
+        )
         timestamps = [
             row.timestamp for row in [*normals, *internals, *[pair[0] for pair in transfers]]
             if row.timestamp > 0
@@ -709,40 +888,43 @@ class FeatureCalculator:
         first = min(timestamps) if timestamps else now
         last = max(timestamps) if timestamps else now
         active_days = max((last - first) / 86400, 1.0)
-        trade_values = [
+        token_trade_values = [
             float(item.get("usd_value", 0.0))
-            for item in swaps
+            for item in token_trades
             if float(item.get("usd_value", 0.0)) > 0
         ]
-        swap_days = {
+        trade_days = {
             datetime.fromtimestamp(item["timestamp"], timezone.utc).date()
-            for item in swaps
+            for item in token_trades
             if item["timestamp"]
         }
         token_assets = {
             leg["asset"]
-            for swap in swaps
-            for leg in [*swap["outgoing"], *swap["incoming"]]
+            for trade in token_trades
+            for leg in [*trade["outgoing"], *trade["incoming"]]
             if asset_kind(str(leg["asset"])) == "token"
         }
         known_prices = sum(
             leg.get("price_usd") is not None
-            for swap in swaps
-            for leg in [*swap["outgoing"], *swap["incoming"]]
+            for trade in token_trades
+            for leg in [*trade["outgoing"], *trade["incoming"]]
         )
         total_legs = sum(
-            len(swap["outgoing"]) + len(swap["incoming"]) for swap in swaps
+            len(trade["outgoing"]) + len(trade["incoming"])
+            for trade in token_trades
         )
-        total_out = float(pnl["cash_out_usd"])
-        total_in = float(pnl["cash_in_usd"])
-        total_gas = sum(gas_by_hash.values())
+        total_transaction_gas = sum(gas_by_hash.values())
+        total_trade_gas = sum(
+            float(item.get("gas_usd", 0.0) or 0.0)
+            for item in token_trades
+        )
         token_volume: dict[str, float] = defaultdict(float)
         stable_volume = 0.0
-        for swap in swaps:
-            notional = float(swap.get("usd_value", 0.0) or 0.0)
+        for trade in token_trades:
+            notional = float(trade.get("usd_value", 0.0) or 0.0)
             token_legs = [
                 leg
-                for leg in [*swap["outgoing"], *swap["incoming"]]
+                for leg in [*trade["outgoing"], *trade["incoming"]]
                 if asset_kind(str(leg.get("asset", ""))) == "token"
             ]
             symbols = {str(leg.get("symbol", "")) for leg in token_legs}
@@ -750,7 +932,7 @@ class FeatureCalculator:
                 token_volume[symbol] += notional / max(len(symbols), 1)
             if any(
                 asset_kind(str(leg.get("asset", ""))) == "stable"
-                for leg in [*swap["outgoing"], *swap["incoming"]]
+                for leg in [*trade["outgoing"], *trade["incoming"]]
             ):
                 stable_volume += notional
         token_volume_total = sum(token_volume.values())
@@ -760,6 +942,21 @@ class FeatureCalculator:
             )
         else:
             top_token_symbol, top_token_volume = "", 0.0
+        financial_features = {
+            key: pnl[key]
+            for key in (
+                "realized_pnl_usd",
+                "unrealized_pnl_usd",
+                "total_pnl_usd",
+                "roi",
+                "wins",
+                "losses",
+                "winrate",
+                "gross_buy_spend_usd",
+                "gross_sell_proceeds_usd",
+                "net_cash_deployed_usd",
+            )
+        }
         features = {
             "wallet_age_days": (now - first) / 86400 if timestamps else 0.0,
             "days_since_last_activity": (now - last) / 86400 if timestamps else 0.0,
@@ -769,8 +966,9 @@ class FeatureCalculator:
             "token_transfer_count": len(transfers),
             "native_balance": balance_wei / 10**18,
             "classified_event_count": len(events),
-            "swap_count": len(swaps),
-            "valued_swap_count": len(trade_values),
+            "token_trade_count": len(token_trades),
+            "valued_token_trade_count": len(token_trade_values),
+            "cash_conversion_count": len(cash_conversions),
             "buy_like_count": sum(
                 item["event_type"] == "buy_like" for item in events
             ),
@@ -795,20 +993,44 @@ class FeatureCalculator:
                 }
                 for item in events
             ),
-            "multi_leg_swap_count": sum(item["is_multi_leg"] for item in swaps),
-            "dex_active_days": len(swap_days),
-            "swaps_per_active_day": len(swaps) / len(swap_days) if swap_days else 0.0,
-            "average_trade_usd": mean(trade_values) if trade_values else 0.0,
-            "median_trade_usd": median(trade_values) if trade_values else 0.0,
-            "max_trade_usd": max(trade_values) if trade_values else 0.0,
-            "total_volume_usd": sum(trade_values),
-            "total_out_usd": total_out,
-            "total_in_usd": total_in,
-            "total_gas_usd": total_gas,
-            "average_gas_per_swap_usd": total_gas / len(swaps) if swaps else 0.0,
-            "gas_share_percent": (
-                total_gas * 100 / sum(trade_values)
-                if trade_values else 0.0
+            "multi_leg_token_trade_count": sum(
+                item["is_multi_leg"] for item in token_trades
+            ),
+            "dex_active_days": len(trade_days),
+            "token_trades_per_active_day": (
+                len(token_trades) / len(trade_days)
+                if trade_days else 0.0
+            ),
+            "average_token_trade_usd": (
+                mean(token_trade_values) if token_trade_values else 0.0
+            ),
+            "median_token_trade_usd": (
+                median(token_trade_values) if token_trade_values else 0.0
+            ),
+            "max_token_trade_usd": (
+                max(token_trade_values) if token_trade_values else 0.0
+            ),
+            "total_token_trade_volume_usd": sum(token_trade_values),
+            "cash_conversion_volume_usd": sum(
+                float(item.get("usd_value", 0.0) or 0.0)
+                for item in cash_conversions
+            ),
+            "max_cash_conversion_usd": max(
+                (
+                    float(item.get("usd_value", 0.0) or 0.0)
+                    for item in cash_conversions
+                ),
+                default=0.0,
+            ),
+            "total_transaction_gas_usd": total_transaction_gas,
+            "total_trade_gas_usd": total_trade_gas,
+            "average_trade_gas_usd": (
+                total_trade_gas / len(token_trades)
+                if token_trades else 0.0
+            ),
+            "trade_gas_share_percent": (
+                total_trade_gas * 100 / sum(token_trade_values)
+                if token_trade_values else 0.0
             ),
             "unique_tokens_traded": len(token_assets),
             "top_token_symbol": top_token_symbol,
@@ -820,26 +1042,52 @@ class FeatureCalculator:
                 stable_volume * 100 / token_volume_total
                 if token_volume_total else 0.0
             ),
-            **{key: value for key, value in pnl.items() if key != "open_positions"},
+            **financial_features,
         }
         quality = {
             "priced_leg_ratio": known_prices / total_legs if total_legs else 1.0,
             "transaction_hash_groups": len(grouped),
-            "reliably_valued_trade_ratio": (
-                len(trade_values) / len(swaps) if swaps else 1.0
+            "reliably_valued_token_trade_ratio": (
+                len(token_trade_values) / len(token_trades)
+                if token_trades else 1.0
             ),
-            "low_confidence_trade_count": sum(
+            "low_confidence_token_trade_count": sum(
                 item["valuation_confidence"] in {"low", "none"}
-                for item in swaps
+                for item in token_trades
             ),
             "max_valuation_divergence": max(
                 (
                     float(item["valuation_divergence"])
-                    for item in swaps
+                    for item in token_trades
                     if item["valuation_divergence"] is not None
                 ),
                 default=0.0,
             ),
+            "pnl_valid": pnl["pnl_valid"],
+            "pnl_basis_coverage_ratio": pnl[
+                "pnl_basis_coverage_ratio"
+            ],
+            "inventory_reconciliation_ratio": pnl[
+                "inventory_reconciliation_ratio"
+            ],
+            "unknown_basis_sale_count": pnl[
+                "unknown_basis_sale_count"
+            ],
+            "unknown_inventory_outflow_count": pnl[
+                "unknown_inventory_outflow_count"
+            ],
+            "inventory_mismatch_count": pnl[
+                "inventory_mismatch_count"
+            ],
+            "unknown_open_position_count": pnl[
+                "unknown_open_position_count"
+            ],
+            "unpriced_open_position_count": pnl[
+                "unpriced_open_position_count"
+            ],
+            "known_realized_pnl_usd": pnl[
+                "known_realized_pnl_usd"
+            ],
             "open_positions": pnl["open_positions"],
         }
         snapshot = self.session.scalar(

@@ -52,6 +52,14 @@ class RpcProvider(ABC):
     ) -> int | None:
         return None
 
+    def token_balance(
+        self,
+        token_address: str,
+        wallet_address: str,
+        block: int | str = "latest",
+    ) -> int | None:
+        return None
+
 
 class HistoricalPriceProvider(ABC):
     @abstractmethod
@@ -228,6 +236,18 @@ class InfuraProvider(RpcProvider):
         try:
             value = int(self.eth_call(address, "0x313ce567", block), 16)
             return value if 0 <= value <= 255 else None
+        except Exception:
+            return None
+
+    def token_balance(
+        self,
+        token_address: str,
+        wallet_address: str,
+        block: int | str = "latest",
+    ) -> int | None:
+        try:
+            data = "0x70a08231" + wallet_address[2:].lower().zfill(64)
+            return int(self.eth_call(token_address, data, block), 16)
         except Exception:
             return None
 

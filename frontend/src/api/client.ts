@@ -29,6 +29,7 @@ interface RawPreview {
   valid_count: number
   duplicate_count: number
   invalid_count: number
+  analyzed_count: number
   source_count: number
   entries: {
     address: string
@@ -36,6 +37,8 @@ interface RawPreview {
     source: string
     row: number
     source_index: string | null
+    already_analyzed: boolean
+    last_analyzed_at: string | null
   }[]
   issues: {
     kind: string
@@ -314,6 +317,7 @@ export function normalizePreview(raw: RawPreview): WalletPreview {
     validCount: raw.valid_count,
     duplicateCount: raw.duplicate_count,
     invalidCount: raw.invalid_count,
+    analyzedCount: raw.analyzed_count,
     sourceCount: raw.source_count,
     entries: raw.entries.map((entry) => ({
       address: entry.address,
@@ -321,6 +325,8 @@ export function normalizePreview(raw: RawPreview): WalletPreview {
       source: entry.source === 'manual' ? 'Ручной ввод' : entry.source,
       row: entry.row,
       sourceIndex: entry.source_index,
+      alreadyAnalyzed: entry.already_analyzed,
+      lastAnalyzedAt: entry.last_analyzed_at,
     })),
     issues: raw.issues.map((issue) => ({
       ...issue,
@@ -356,16 +362,21 @@ export function normalizeJob(raw: RawJob, importName?: string): Job {
 function featureValueType(id: string, values: unknown[]): FeatureColumn['type'] {
   const present = values.find((value) => value !== null && value !== undefined)
   if (id.endsWith('_at')) return 'date'
+  if (/(^|_)usd($|_)/i.test(id) && (present === undefined || typeof present === 'number')) {
+    return 'currency'
+  }
+  if (/(ratio|rate|share|percent)/i.test(id) && (present === undefined || typeof present === 'number')) {
+    return 'percent'
+  }
   if (typeof present === 'boolean') return 'boolean'
   if (typeof present === 'number') {
-    if (/(^|_)usd($|_)/i.test(id)) return 'currency'
-    if (/(ratio|rate|share|percent)/i.test(id)) return 'percent'
     return 'number'
   }
   return 'string'
 }
 
 function labelForColumn(id: string) {
+  if (id === 'created_at') return 'Дата анализа'
   return titleCase(id.replace(/^quality\./, 'Качество: '))
 }
 
@@ -382,6 +393,7 @@ export function normalizeFeaturePage(raw: RawFeaturePage): FeaturePage {
       row[key] = value as FeatureRow[string]
     })
     Object.entries(item.quality).forEach(([key, value]) => {
+      if (key === 'open_positions') return
       row[`quality.${key}`] = value as FeatureRow[string]
     })
     return row
@@ -389,6 +401,7 @@ export function normalizeFeaturePage(raw: RawFeaturePage): FeaturePage {
   const baseIds = ['address', 'version', 'as_of_block', 'created_at']
   const featureIds = Array.from(new Set(raw.items.flatMap((item) => Object.keys(item.features)))).sort()
   const qualityIds = Array.from(new Set(raw.items.flatMap((item) => Object.keys(item.quality))))
+    .filter((id) => id !== 'open_positions')
     .sort()
     .map((id) => `quality.${id}`)
   const columns: FeatureColumn[] = [...baseIds, ...featureIds, ...qualityIds].map((id) => ({
@@ -469,10 +482,15 @@ export function normalizeClusterRun(raw: RawClusterRun): ClusteringJob {
   }
 }
 
-export async function previewWalletSources(files: File[], manual: string): Promise<WalletPreview> {
+export async function previewWalletSources(
+  files: File[],
+  manual: string,
+  chain = 'ethereum',
+): Promise<WalletPreview> {
   const body = new FormData()
   files.forEach((file) => body.append('files', file))
   if (manual.trim()) body.append('manual_text', manual)
+  body.append('chain', chain)
   return normalizePreview(await request<RawPreview>('/imports/preview', { method: 'POST', body }))
 }
 
@@ -480,10 +498,16 @@ export async function createWalletBatch(
   token: string,
   name: string,
   chain: string,
+  excludedAddresses: string[] = [],
 ): Promise<Job> {
   const response = await request<{ import: RawImport; job: RawJob }>(
     '/imports/confirm',
-    jsonRequest('POST', { token, name, chain }),
+    jsonRequest('POST', {
+      token,
+      name,
+      chain,
+      excluded_addresses: excludedAddresses,
+    }),
   )
   return normalizeJob(response.job, response.import.name)
 }

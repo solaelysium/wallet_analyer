@@ -11,6 +11,10 @@ interface PreviewModalProps {
   onChainChange: (value: string) => void
   onClose: () => void
   onConfirm: () => void
+  excludedAddresses: Set<string>
+  onToggleAddress: (address: string) => void
+  onSelectAll: () => void
+  onSelectOnlyNew: () => void
   confirming: boolean
   confirmError?: string
 }
@@ -24,6 +28,10 @@ export function PreviewModal({
   onChainChange,
   onClose,
   onConfirm,
+  excludedAddresses,
+  onToggleAddress,
+  onSelectAll,
+  onSelectOnlyNew,
   confirming,
   confirmError,
 }: PreviewModalProps) {
@@ -39,6 +47,15 @@ export function PreviewModal({
     counts.issues += 1
     sourceCounts.set(issue.source, counts)
   })
+  const selectedCount = preview.entries.length - excludedAddresses.size
+
+  function analysisDate(value: string | null) {
+    if (!value) return ''
+    return new Intl.DateTimeFormat('ru-RU', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date(value))
+  }
 
   return (
     <Modal
@@ -51,20 +68,20 @@ export function PreviewModal({
           <button
             className="button primary"
             type="button"
-            disabled={confirming || !batchName.trim()}
+            disabled={confirming || !batchName.trim() || selectedCount === 0}
             onClick={onConfirm}
           >
             <CheckCircle2 size={17} />
-            {confirming ? 'Создание пакета…' : 'Подтвердить пакет'}
+            {confirming ? 'Создание пакета…' : `Запустить анализ (${selectedCount})`}
           </button>
         </>
       }
     >
       <div className="metric-grid">
-        <div><strong>{preview.validCount.toLocaleString('ru-RU')}</strong><span>Корректных уникальных адресов</span></div>
+        <div><strong>{selectedCount.toLocaleString('ru-RU')} / {preview.validCount.toLocaleString('ru-RU')}</strong><span>Выбрано для анализа</span></div>
+        <div><strong>{preview.analyzedCount.toLocaleString('ru-RU')}</strong><span>Уже проверялись ранее</span></div>
         <div><strong>{preview.duplicateCount.toLocaleString('ru-RU')}</strong><span>Удалено дубликатов</span></div>
         <div><strong>{preview.invalidCount.toLocaleString('ru-RU')}</strong><span>Некорректных строк</span></div>
-        <div><strong>{preview.sourceCount}</strong><span>Источников</span></div>
       </div>
       <div className="parameter-grid">
         <label className="field">
@@ -91,16 +108,37 @@ export function PreviewModal({
           </div>
         </section>
         <section>
-          <h3>Предпросмотр записей</h3>
+          <div className="preview-list-heading">
+            <h3>Предпросмотр записей</h3>
+            <div>
+              <button className="text-button" type="button" onClick={onSelectAll}>Выбрать все</button>
+              <button className="text-button" type="button" onClick={onSelectOnlyNew}>Только новые</button>
+            </div>
+          </div>
           <div className="address-preview" tabIndex={0}>
             {preview.entries.map((entry) => (
-              <div className="preview-entry" key={`${entry.source}-${entry.row}-${entry.address}`}>
-                <code>{entry.checksumAddress}</code>
-                <span>
-                  {entry.source}, строка {entry.row}
-                  {entry.sourceIndex !== null ? ` · index ${entry.sourceIndex}` : ''}
-                </span>
-              </div>
+              <label
+                className={`preview-entry${excludedAddresses.has(entry.address) ? ' excluded' : ''}`}
+                key={`${entry.source}-${entry.row}-${entry.address}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={!excludedAddresses.has(entry.address)}
+                  onChange={() => onToggleAddress(entry.address)}
+                />
+                <div>
+                  <code>{entry.checksumAddress}</code>
+                  <span>
+                    {entry.source}, строка {entry.row}
+                    {entry.sourceIndex !== null ? ` · index ${entry.sourceIndex}` : ''}
+                  </span>
+                  <span className={entry.alreadyAnalyzed ? 'analysis-status existing' : 'analysis-status'}>
+                    {entry.alreadyAnalyzed
+                      ? `Проверен ${analysisDate(entry.lastAnalyzedAt)}`
+                      : 'Ранее не проверялся'}
+                  </span>
+                </div>
+              </label>
             ))}
           </div>
         </section>

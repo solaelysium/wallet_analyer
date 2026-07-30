@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createWalletBatch,
   getClusteringJobs,
+  getCurrentFeatureDataset,
   getFeatures,
   normalizeJob,
   previewWalletSources,
@@ -29,12 +30,14 @@ describe('backend API contract adapters', () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = init?.body as FormData
       expect(body.get('manual_text')).toBe('0xabc')
+      expect(body.get('chain')).toBe('ethereum')
       expect(body.getAll('files')).toHaveLength(1)
       return new Response(JSON.stringify({
         token: 'sealed-token',
         valid_count: 1,
         duplicate_count: 1,
         invalid_count: 1,
+        analyzed_count: 1,
         source_count: 2,
         entries: [{
           address: '0x1111111111111111111111111111111111111111',
@@ -42,6 +45,8 @@ describe('backend API contract adapters', () => {
           source: 'wallets.csv',
           row: 2,
           source_index: 'a-1',
+          already_analyzed: true,
+          last_analyzed_at: '2026-07-29T20:00:00+00:00',
         }],
         issues: [{
           kind: 'duplicate',
@@ -62,9 +67,14 @@ describe('backend API contract adapters', () => {
       validCount: 1,
       duplicateCount: 1,
       invalidCount: 1,
+      analyzedCount: 1,
       sourceCount: 2,
     })
-    expect(preview.entries[0].sourceIndex).toBe('a-1')
+    expect(preview.entries[0]).toMatchObject({
+      sourceIndex: 'a-1',
+      alreadyAnalyzed: true,
+      lastAnalyzedAt: '2026-07-29T20:00:00+00:00',
+    })
     expect(preview.issues[0].detail).toContain('First seen')
   })
 
@@ -74,6 +84,7 @@ describe('backend API contract adapters', () => {
         token: 'sealed-token',
         name: 'July wallets',
         chain: 'ethereum',
+        excluded_addresses: ['0xskip'],
       })
       return new Response(JSON.stringify({
         import: {
@@ -87,7 +98,12 @@ describe('backend API contract adapters', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const job = await createWalletBatch('sealed-token', 'July wallets', 'ethereum')
+    const job = await createWalletBatch(
+      'sealed-token',
+      'July wallets',
+      'ethereum',
+      ['0xskip'],
+    )
 
     expect(fetchMock.mock.calls[0][0]).toBe('/api/imports/confirm')
     expect(job).toMatchObject({
@@ -109,8 +125,17 @@ describe('backend API contract adapters', () => {
         version: 'wallet_features.v1',
         as_of_block: 123,
         created_at: '2026-07-29T20:00:00+00:00',
-        features: { balance_usd: 120.5, tx_count: 8 },
-        quality: { price_coverage: 0.9 },
+        features: {
+          balance_usd: 120.5,
+          tx_count: 8,
+          realized_pnl_usd: null,
+        },
+        quality: {
+          price_coverage: 0.9,
+          open_positions: {
+            '0xtoken': { quantity: 1, symbol: 'AAA' },
+          },
+        },
       }],
       total: 51,
       page: 1,
@@ -138,7 +163,42 @@ describe('backend API contract adapters', () => {
       tx_count: 8,
       'quality.price_coverage': 0.9,
     })
+    expect(page.rows[0]).not.toHaveProperty('quality.open_positions')
+    expect(page.columns.find((column) => column.id === 'quality.open_positions')).toBeUndefined()
     expect(page.columns.find((column) => column.id === 'tx_count')?.source).toBe('feature')
+    expect(page.columns.find((column) => column.id === 'created_at')?.label).toBe('Дата анализа')
+    expect(page.columns.find((column) => column.id === 'realized_pnl_usd')?.type).toBe('currency')
+  })
+
+  it('excludes nullable strict PnL from the clustering dataset', async () => {
+    const item = {
+      snapshot_id: 10,
+      wallet_id: 3,
+      address: '0x1111111111111111111111111111111111111111',
+      version: 'wallet_features.v4',
+      as_of_block: 123,
+      created_at: '2026-07-29T20:00:00+00:00',
+      features: {
+        total_token_trade_volume_usd: 9000,
+        realized_pnl_usd: null,
+        roi: null,
+      },
+      quality: { pnl_valid: false },
+    }
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      items: [item],
+      total: 1,
+      page: 1,
+      size: 500,
+    })))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const dataset = await getCurrentFeatureDataset()
+
+    expect(dataset?.version).toBe('wallet_features.v4')
+    expect(dataset?.numericFeatures).toContain('total_token_trade_volume_usd')
+    expect(dataset?.numericFeatures).not.toContain('realized_pnl_usd')
+    expect(dataset?.numericFeatures).not.toContain('roi')
   })
 
   it('fetches completed cluster details and transforms assignments and profile objects', async () => {

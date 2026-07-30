@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from datetime import datetime
 from pathlib import Path
 
 from eth_utils import is_address, to_checksum_address
@@ -13,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import SecretBox
-from .models import Chain, Job, JobItem, WalletImport, WalletImportMember
+from .models import Chain, Job, JobItem, Wallet, WalletImport, WalletImportMember
 from .repositories import WalletRepository, log_event
 
 
@@ -31,6 +32,8 @@ class PreviewEntry(BaseModel):
     source: str
     row: int
     source_index: str | None = None
+    already_analyzed: bool = False
+    last_analyzed_at: datetime | None = None
 
 
 class ImportPreview(BaseModel):
@@ -38,6 +41,7 @@ class ImportPreview(BaseModel):
     valid_count: int
     duplicate_count: int
     invalid_count: int
+    analyzed_count: int
     source_count: int
     entries: list[PreviewEntry]
     issues: list[ImportIssue]
@@ -47,6 +51,7 @@ class ConfirmImport(BaseModel):
     token: str
     name: str = Field(min_length=1, max_length=255)
     chain: str = "ethereum"
+    excluded_addresses: list[str] = Field(default_factory=list)
 
 
 def normalize_address(value: object) -> tuple[str, str]:
@@ -159,9 +164,11 @@ def _rows_from_text(data: bytes) -> list[dict]:
 
 
 async def preview_import(
+    session: Session,
     files: list[UploadFile],
     manual_text: str,
     secret_box: SecretBox,
+    chain_slug: str = "ethereum",
 ) -> ImportPreview:
     sources: list[tuple[str, list[dict]]] = []
     for upload in files:
@@ -223,8 +230,31 @@ async def preview_import(
             seen[address] = entry
             entries.append(entry)
 
+    chain = session.scalar(select(Chain).where(Chain.slug == chain_slug))
+    if chain is None or not chain.enabled:
+        raise ValueError("Сеть неизвестна или отключена")
+    known_wallets = {
+        wallet.address: wallet
+        for wallet in session.scalars(
+            select(Wallet).where(
+                Wallet.chain_id == chain.id,
+                Wallet.address.in_([entry.address for entry in entries]),
+            )
+        ).all()
+    }
+    for entry in entries:
+        wallet = known_wallets.get(entry.address)
+        if wallet and wallet.last_collected_at is not None:
+            entry.already_analyzed = True
+            entry.last_analyzed_at = wallet.last_collected_at
+
     payload = json.dumps(
-        {"version": 1, "entries": [entry.model_dump() for entry in entries]},
+        {
+            "version": 1,
+            "entries": [
+                entry.model_dump(mode="json") for entry in entries
+            ],
+        },
         separators=(",", ":"),
     )
     token = secret_box.seal_json(payload)
@@ -233,6 +263,7 @@ async def preview_import(
         valid_count=len(entries),
         duplicate_count=sum(issue.kind == "duplicate" for issue in issues),
         invalid_count=sum(issue.kind == "invalid" for issue in issues),
+        analyzed_count=sum(entry.already_analyzed for entry in entries),
         source_count=len(sources),
         entries=entries,
         issues=issues,
@@ -250,7 +281,13 @@ def confirm_import(
         raise ValueError("Некорректный или нечитаемый токен предпросмотра") from exc
     if payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
         raise ValueError("Неподдерживаемый токен предпросмотра")
-    if not payload["entries"]:
+    excluded = {address.lower() for address in request.excluded_addresses}
+    entries = [
+        entry
+        for entry in payload["entries"]
+        if str(entry.get("address", "")).lower() not in excluded
+    ]
+    if not entries:
         raise ValueError("В импорте нет корректных адресов кошельков")
 
     chain = session.scalar(select(Chain).where(Chain.slug == request.chain))
@@ -261,15 +298,15 @@ def confirm_import(
         chain_id=chain.id,
         name=request.name,
         source_summary={
-            "sources": sorted({entry["source"] for entry in payload["entries"]})
+            "sources": sorted({entry["source"] for entry in entries})
         },
-        wallet_count=len(payload["entries"]),
+        wallet_count=len(entries),
     )
     session.add(batch)
     session.flush()
     wallets = WalletRepository(session)
     members = []
-    for entry in payload["entries"]:
+    for entry in entries:
         normalized, checksum = normalize_address(entry["address"])
         wallet = wallets.get_or_create(chain.id, normalized, checksum)
         member = WalletImportMember(

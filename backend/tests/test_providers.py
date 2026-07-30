@@ -37,3 +37,23 @@ def test_wallet_check_rejects_empty_address() -> None:
 
     with pytest.raises(ValueError, match="Адрес не указан"):
         provider.is_wallet("")
+
+
+def test_token_balance_uses_erc20_balance_of(monkeypatch) -> None:
+    provider = InfuraProvider(KeyPool({}))
+    captured = {}
+
+    def eth_call(to: str, data: str, block: int | str = "latest") -> str:
+        captured.update({"to": to, "data": data, "block": block})
+        return hex(123_000_000)
+
+    monkeypatch.setattr(provider, "eth_call", eth_call)
+    token = "0x00000000000000000000000000000000000000aa"
+    wallet = "0x0000000000000000000000000000000000000011"
+
+    assert provider.token_balance(token, wallet, 100) == 123_000_000
+    assert captured == {
+        "to": token,
+        "data": "0x70a08231" + wallet[2:].zfill(64),
+        "block": 100,
+    }

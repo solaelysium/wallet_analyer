@@ -21,7 +21,7 @@ from .repositories import log_event
 class ClusterRequest(BaseModel):
     algorithm: str = "kmeans"
     reducer: str = "pca"
-    feature_version: str = "wallet_features.v3"
+    feature_version: str = "wallet_features.v4"
     feature_names: list[str] = []
     n_clusters: int = Field(default=3, ge=2, le=50)
     min_cluster_size: int = Field(default=5, ge=2, le=1000)
