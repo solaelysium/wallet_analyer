@@ -13,6 +13,8 @@ from app.analytics import (
     derive_events,
     derive_swaps,
     group_transaction_legs,
+    is_cash_conversion_event,
+    is_token_trade_event,
 )
 from app.models import (
     Chain,
@@ -173,8 +175,24 @@ def test_fifo_gas_is_counted_once_in_cost_and_realized_pnl() -> None:
     assert result["total_trade_gas_usd"] == pytest.approx(5.0)
 
 
-def test_price_resolver_uses_and_caches_onchain_fallback(app_client) -> None:
+def test_price_resolver_skips_onchain_fallback_by_default(app_client, monkeypatch) -> None:
     _, database = app_client
+    monkeypatch.setattr("app.analytics._USE_UNISWAP_FALLBACK", False)
+    monkeypatch.setattr("app.analytics._PRICE_CACHE", {})
+    with database.session() as session:
+        resolver = PriceResolver(session, EmptyPrices(), OnchainPrices(), 1)
+        price = resolver.resolve(TOKEN_A, "AAA", 18, 1_700_000_000, 18_000_000)
+        stored = session.scalar(
+            select(TokenPrice).where(TokenPrice.source == "uniswap_v2")
+        )
+        assert price is None
+        assert stored is None
+
+
+def test_price_resolver_can_use_onchain_fallback(app_client, monkeypatch) -> None:
+    _, database = app_client
+    monkeypatch.setattr("app.analytics._USE_UNISWAP_FALLBACK", True)
+    monkeypatch.setattr("app.analytics._PRICE_CACHE", {})
     with database.session() as session:
         resolver = PriceResolver(session, EmptyPrices(), OnchainPrices(), 1)
         price = resolver.resolve(TOKEN_A, "AAA", 18, 1_700_000_000, 18_000_000)
@@ -186,8 +204,10 @@ def test_price_resolver_uses_and_caches_onchain_fallback(app_client) -> None:
         assert stored.price_usd == pytest.approx(12.5)
 
 
-def test_price_resolver_does_not_trust_stablecoin_symbol(app_client) -> None:
+def test_price_resolver_does_not_trust_stablecoin_symbol(app_client, monkeypatch) -> None:
     _, database = app_client
+    monkeypatch.setattr("app.analytics._USE_UNISWAP_FALLBACK", True)
+    monkeypatch.setattr("app.analytics._PRICE_CACHE", {})
     official_usdc = next(iter(STABLECOINS))
     with database.session() as session:
         resolver = PriceResolver(session, EmptyPrices(), OnchainPrices(), 1)
@@ -272,10 +292,13 @@ def test_suspicious_symbols_and_failed_transactions_are_excluded(app_client) -> 
         assert snapshot.features["normal_transaction_count"] == 0
         assert snapshot.features["token_trade_count"] == 0
         assert snapshot.features["gross_buy_spend_usd"] == 0
-        assert snapshot.features["realized_pnl_usd"] is None
-        assert snapshot.quality["pnl_valid"] is False
-        assert snapshot.quality["unknown_open_position_count"] == 1
-        assert snapshot.quality["inventory_reconciliation_ratio"] == 1
+        assert snapshot.features["realized_pnl_usd"] == pytest.approx(0.0)
+        assert snapshot.features["winrate"] == pytest.approx(0.0)
+        assert snapshot.features["covered_sell_count"] == 0
+        # transfer_in is not trading inventory, so completeness stays true
+        # when there are no unmatched sell_like events.
+        assert snapshot.quality["pnl_valid"] is True
+        assert snapshot.quality["unknown_open_position_count"] == 0
         assert snapshot.quality["transaction_hash_groups"] == 1
 
 
@@ -415,7 +438,7 @@ def test_transfer_out_removes_fifo_inventory_without_realizing_pnl() -> None:
     assert result["gross_buy_spend_usd"] == pytest.approx(101.0)
 
 
-def test_unknown_transfer_basis_suppresses_all_pnl_metrics() -> None:
+def test_unknown_transfer_in_does_not_create_trading_basis() -> None:
     events = [
         {
             "tx_hash": "deposit",
@@ -458,13 +481,14 @@ def test_unknown_transfer_basis_suppresses_all_pnl_metrics() -> None:
     assert result["pnl_basis_coverage_ratio"] == pytest.approx(0.0)
     assert result["unknown_basis_sale_count"] == 1
     assert result["gross_sell_proceeds_usd"] == pytest.approx(120.0)
-    assert result["realized_pnl_usd"] is None
-    assert result["total_pnl_usd"] is None
-    assert result["roi"] is None
-    assert result["winrate"] is None
+    assert result["realized_pnl_usd"] == pytest.approx(0.0)
+    assert result["winrate"] == pytest.approx(0.0)
+    assert result["covered_sell_count"] == 0
+    assert result["pnl_valid"] is False
+    assert result["open_positions"] == {}
 
 
-def test_inventory_mismatch_suppresses_pnl() -> None:
+def test_inventory_mismatch_is_diagnostic_only_for_trading_pnl() -> None:
     event = {
         "tx_hash": "buy",
         "timestamp": 1,
@@ -491,8 +515,11 @@ def test_inventory_mismatch_suppresses_pnl() -> None:
 
     assert result["inventory_mismatch_count"] == 1
     assert result["inventory_reconciliation_ratio"] == pytest.approx(0.0)
-    assert result["pnl_valid"] is False
-    assert result["unrealized_pnl_usd"] is None
+    # Buy/sell sample is complete even if residual trading lot != chain balance.
+    assert result["pnl_valid"] is True
+    assert result["unrealized_pnl_usd"] == pytest.approx(19.0)
+    assert result["realized_pnl_usd"] == pytest.approx(0.0)
+    assert result["total_pnl_usd"] == pytest.approx(19.0)
 
 
 def test_cash_conversion_is_not_counted_as_token_investment() -> None:
@@ -518,3 +545,83 @@ def test_cash_conversion_is_not_counted_as_token_investment() -> None:
     assert result["token_trade_count"] == 0
     assert result["gross_buy_spend_usd"] == pytest.approx(0.0)
     assert result["gross_sell_proceeds_usd"] == pytest.approx(0.0)
+
+
+def test_stable_token_trades_and_token_swaps_count_as_trading() -> None:
+    usdc = next(iter(STABLECOINS))
+    buy = {
+        "tx_hash": "buy-stable",
+        "timestamp": 1,
+        "event_type": "buy_like",
+        "usd_value": 100.0,
+        "gas_usd": 1.0,
+        "outgoing": [{"asset": usdc, "symbol": "USDC", "amount": 100.0}],
+        "incoming": [
+            {
+                "asset": TOKEN_A,
+                "symbol": "AAA",
+                "decimals": 18,
+                "amount": 10.0,
+                "usd_value": 100.0,
+            }
+        ],
+    }
+    sell = {
+        "tx_hash": "sell-stable",
+        "timestamp": 2,
+        "event_type": "sell_like",
+        "usd_value": 130.0,
+        "gas_usd": 1.0,
+        "outgoing": [
+            {
+                "asset": TOKEN_A,
+                "symbol": "AAA",
+                "decimals": 18,
+                "amount": 10.0,
+            }
+        ],
+        "incoming": [{"asset": usdc, "symbol": "USDC", "amount": 130.0}],
+    }
+    token_swap = {
+        "tx_hash": "token-swap",
+        "timestamp": 3,
+        "event_type": "swap_like",
+        "usd_value": 50.0,
+        "gas_usd": 1.0,
+        "outgoing": [
+            {
+                "asset": TOKEN_A,
+                "symbol": "AAA",
+                "decimals": 18,
+                "amount": 1.0,
+                "usd_value": 50.0,
+            }
+        ],
+        "incoming": [
+            {
+                "asset": TOKEN_B,
+                "symbol": "BBB",
+                "decimals": 18,
+                "amount": 2.0,
+                "usd_value": 50.0,
+            }
+        ],
+    }
+
+    assert is_token_trade_event(buy) is True
+    assert is_token_trade_event(sell) is True
+    assert is_token_trade_event(token_swap) is True
+    assert is_cash_conversion_event(token_swap) is False
+
+    paired = compute_fifo_pnl([buy, sell])
+    assert paired["token_trade_count"] == 2
+    assert paired["gross_buy_spend_usd"] == pytest.approx(101.0)
+    assert paired["gross_sell_proceeds_usd"] == pytest.approx(130.0)
+    assert paired["realized_pnl_usd"] == pytest.approx(28.0)
+    assert paired["pnl_valid"] is True
+
+    swap_only = compute_fifo_pnl([token_swap])
+    assert swap_only["token_trade_count"] == 1
+    assert swap_only["cash_conversion_count"] == 0
+    assert swap_only["unknown_basis_sale_count"] == 1
+    assert swap_only["open_positions"][TOKEN_B]["quantity"] == pytest.approx(2.0)

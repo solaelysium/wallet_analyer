@@ -1,6 +1,7 @@
 import { CheckCircle2 } from 'lucide-react'
 import type { WalletPreview } from '../../api/types'
 import { Modal } from '../../components/Modal'
+import { formatDateTime } from '../../utils/datetime'
 
 interface PreviewModalProps {
   preview: WalletPreview | null
@@ -51,10 +52,7 @@ export function PreviewModal({
 
   function analysisDate(value: string | null) {
     if (!value) return ''
-    return new Intl.DateTimeFormat('ru-RU', {
-      dateStyle: 'medium',
-      timeStyle: 'short',
-    }).format(new Date(value))
+    return formatDateTime(value)
   }
 
   return (

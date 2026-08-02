@@ -1,4 +1,5 @@
 import type { FeatureColumn } from '../../api/types'
+import { formatDateTime } from '../../utils/datetime'
 
 export function formatFeatureValue(
   value: string | number | boolean | null,
@@ -9,7 +10,7 @@ export function formatFeatureValue(
   if (type === 'boolean') return value ? 'Да' : 'Нет'
   if (type === 'date') {
     const date = new Date(String(value))
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('ru-RU')
+    return Number.isNaN(date.getTime()) ? String(value) : formatDateTime(date)
   }
   if (type === 'currency' && typeof value === 'number') {
     return new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value)

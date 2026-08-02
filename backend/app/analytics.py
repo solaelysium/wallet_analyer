@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,13 @@ from .token_rules import (
 
 FEATURE_VERSION = "wallet_features.v4"
 TRADE_EVENT_TYPES = {"buy_like", "sell_like", "swap_like"}
+# Uniswap V2 fallback does multiple eth_calls per miss and stalls features.
+_USE_UNISWAP_FALLBACK = False
+# Daily buckets are enough for wallet analytics and match CoinGecko granularity.
+_PRICE_BUCKET_SECONDS = 86400
+_PRICE_CACHE: dict[tuple[str, int], object] = {}
+_PRICE_CACHE_LOCK = threading.Lock()
+_ETH_HISTORY_WARMED = False
 
 
 def safe_int(value: object, default: int = 0) -> int:
@@ -112,6 +120,81 @@ class PriceResolver:
         )
         return quote.price_usd if quote else None
 
+    def _bucket(self, timestamp: int) -> int:
+        return int(timestamp) // _PRICE_BUCKET_SECONDS
+
+    def _fill_process_cache(
+        self,
+        address: str,
+        rows: list[tuple[int, float]],
+        confidence: str,
+        source: str = "coingecko",
+    ) -> None:
+        if not rows:
+            return
+        ordered = sorted(rows, key=lambda item: item[0])
+        with _PRICE_CACHE_LOCK:
+            for index, (quote_timestamp, price) in enumerate(ordered):
+                quote = PriceQuote(price, source, confidence)
+                day = self._bucket(quote_timestamp)
+                _PRICE_CACHE[(address, day)] = quote
+                if index + 1 >= len(ordered):
+                    continue
+                next_day = self._bucket(ordered[index + 1][0])
+                fill_day = day + 1
+                while fill_day < next_day:
+                    _PRICE_CACHE[(address, fill_day)] = quote
+                    fill_day += 1
+
+    def _store_process_cache(self, address: str, bucket: int, quote: PriceQuote | None) -> None:
+        with _PRICE_CACHE_LOCK:
+            _PRICE_CACHE[(address, bucket)] = quote
+
+    def _load_process_cache(self, address: str, bucket: int) -> tuple[bool, PriceQuote | None]:
+        with _PRICE_CACHE_LOCK:
+            if (address, bucket) in _PRICE_CACHE:
+                return True, _PRICE_CACHE[(address, bucket)]
+            for delta in (1, -1, 2, -2, 3, -3):
+                nearby = (address, bucket + delta)
+                if nearby in _PRICE_CACHE and _PRICE_CACHE[nearby] is not None:
+                    return True, _PRICE_CACHE[nearby]
+        return False, None
+
+    def _warm_eth_history(self) -> None:
+        global _ETH_HISTORY_WARMED
+        with _PRICE_CACHE_LOCK:
+            if _ETH_HISTORY_WARMED:
+                return
+            _ETH_HISTORY_WARMED = True
+        now = int(datetime.now(timezone.utc).timestamp())
+        start = 1_514_764_800  # 2018-01-01
+        try:
+            rows = self.provider.prices(
+                "ethereum", None, "ethereum", start, now + 86400
+            )
+        except (NoProviderKeyError, RuntimeError, ValueError):
+            rows = []
+        if not rows:
+            return
+        token = self._token(NATIVE_ADDRESS, "ETH", 18)
+        self._fill_process_cache(NATIVE_ADDRESS, rows, "high")
+        self._fill_process_cache(WETH_ADDRESS, rows, "high")
+        from .repositories import sqlite_upsert
+
+        for quote_timestamp, price in rows:
+            sqlite_upsert(
+                self.session,
+                TokenPrice,
+                {
+                    "token_id": token.id,
+                    "timestamp": int(quote_timestamp),
+                    "price_usd": price,
+                    "source": "coingecko",
+                    "block_number": None,
+                },
+                ["token_id", "timestamp", "source"],
+            )
+
     def resolve_quote(
         self,
         address: str,
@@ -123,19 +206,35 @@ class PriceResolver:
         address = address.lower()
         if address in STABLECOINS:
             return PriceQuote(1.0, "canonical_stablecoin", "high")
-        token = self._token(address.lower(), symbol, decimals)
-        bucket = timestamp // 1800
+        bucket = self._bucket(timestamp)
+        hit, cached_quote = self._load_process_cache(address, bucket)
+        if hit:
+            return cached_quote
+        # Junk ERC-20s: skip CoinGecko entirely. PnL uses trusted quote legs.
+        if asset_kind(address) == "token" and not _USE_UNISWAP_FALLBACK:
+            self._store_process_cache(address, bucket, None)
+            return None
+        if address in ETH_LIKE_ADDRESSES:
+            self._warm_eth_history()
+            hit, cached_quote = self._load_process_cache(NATIVE_ADDRESS, bucket)
+            if hit:
+                self._store_process_cache(address, bucket, cached_quote)
+                return cached_quote
+            hit, cached_quote = self._load_process_cache(address, bucket)
+            if hit:
+                return cached_quote
+        token = self._token(address, symbol, decimals)
         key = (token.id, bucket)
         if key in self.memory:
+            self._store_process_cache(address, bucket, self.memory[key])
             return self.memory[key]
-        window = 6 * 3600
+        window = 2 * 86400
         cached = self.session.scalar(
             select(TokenPrice)
             .where(
                 TokenPrice.token_id == token.id,
                 TokenPrice.timestamp.between(timestamp - window, timestamp + window),
             )
-            .order_by(func.abs(TokenPrice.timestamp - timestamp))
             .limit(1)
         )
         if cached is not None:
@@ -149,47 +248,67 @@ class PriceResolver:
                 ),
             )
             self.memory[key] = quote
+            self._store_process_cache(address, bucket, quote)
             return quote
+        # Optional Uniswap fallback for non-trusted assets.
+        if asset_kind(address) == "token":
+            if _USE_UNISWAP_FALLBACK and block_number is not None:
+                price = self.rpc_provider.token_price_usd_at_block(
+                    token.address, block_number
+                )
+                if price is not None and price > 0:
+                    self.session.add(
+                        TokenPrice(
+                            token_id=token.id,
+                            timestamp=timestamp,
+                            price_usd=price,
+                            source="uniswap_v2",
+                            block_number=block_number,
+                        )
+                    )
+                    self.session.flush()
+                    quote = PriceQuote(price, "uniswap_v2", "low")
+                    self.memory[key] = quote
+                    self._store_process_cache(address, bucket, quote)
+                    return quote
+            self.memory[key] = None
+            self._store_process_cache(address, bucket, None)
+            return None
         rows = []
         try:
+            span = 30 * 86400 if address in ETH_LIKE_ADDRESSES else 24 * 3600
             rows = self.provider.prices(
                 "ethereum",
                 None if token.coingecko_id else token.address,
                 token.coingecko_id,
-                timestamp - 24 * 3600,
-                timestamp + 24 * 3600,
+                timestamp - span,
+                timestamp + span,
             )
         except (NoProviderKeyError, RuntimeError, ValueError):
             pass
+        conf = "high" if address in ETH_LIKE_ADDRESSES else "medium"
+        self._fill_process_cache(address, rows, conf)
         for quote_timestamp, price in rows:
-            exists = self.session.scalar(
-                select(TokenPrice.id).where(
-                    TokenPrice.token_id == token.id,
-                    TokenPrice.timestamp == quote_timestamp,
-                    TokenPrice.source == "coingecko",
+            self.session.add(
+                TokenPrice(
+                    token_id=token.id,
+                    timestamp=int(quote_timestamp),
+                    price_usd=price,
+                    source="coingecko",
+                    block_number=block_number,
                 )
             )
-            if exists is None:
-                self.session.add(
-                    TokenPrice(
-                        token_id=token.id,
-                        timestamp=quote_timestamp,
-                        price_usd=price,
-                        source="coingecko",
-                        block_number=block_number,
-                    )
-                )
-        self.session.flush()
         if rows:
+            try:
+                self.session.flush()
+            except Exception:
+                self.session.rollback()
             price = min(rows, key=lambda item: abs(item[0] - timestamp))[1]
-            quote = PriceQuote(
-                price,
-                "coingecko",
-                "high" if address in ETH_LIKE_ADDRESSES else "medium",
-            )
+            quote = PriceQuote(price, "coingecko", conf)
             self.memory[key] = quote
+            self._store_process_cache(address, bucket, quote)
             return quote
-        if block_number is not None:
+        if _USE_UNISWAP_FALLBACK and block_number is not None:
             price = self.rpc_provider.token_price_usd_at_block(
                 token.address, block_number
             )
@@ -206,8 +325,10 @@ class PriceResolver:
                 self.session.flush()
                 quote = PriceQuote(price, "uniswap_v2", "low")
                 self.memory[key] = quote
+                self._store_process_cache(address, bucket, quote)
                 return quote
         self.memory[key] = None
+        self._store_process_cache(address, bucket, None)
         return None
 
 
@@ -484,9 +605,15 @@ def is_cash_conversion_event(event: dict) -> bool:
 
 
 def is_token_trade_event(event: dict) -> bool:
-    if event.get("event_type") in {"buy_like", "sell_like"}:
+    # Trading set aligned with notify intent:
+    # - buy_like:  stable/ETH/WETH -> token
+    # - sell_like: token -> stable/ETH/WETH
+    # - token <-> token swap_like
+    # ETH/WETH <-> stable remains cash conversion, not a token trade.
+    event_type = event.get("event_type")
+    if event_type in {"buy_like", "sell_like"}:
         return True
-    if event.get("event_type") != "swap_like":
+    if event_type != "swap_like" or is_cash_conversion_event(event):
         return False
     return any(
         asset_kind(str(leg.get("asset", ""))) == "token"
@@ -565,6 +692,7 @@ def compute_fifo_pnl(
         key=lambda item: (item.get("timestamp", 0), item.get("tx_hash", "")),
     )
     for event in ordered_events:
+        event_type = str(event.get("event_type", ""))
         outgoing = event.get("outgoing", [])
         incoming = event.get("incoming", [])
         notional = float(
@@ -587,10 +715,20 @@ def compute_fifo_pnl(
         if cash_conversion:
             cash_conversion_count += 1
             cash_conversion_volume += notional
-        if event.get("event_type") == "buy_like":
+        if event_type == "buy_like":
             gross_buy_spend += notional + gas_usd
-        if event.get("event_type") == "sell_like":
+        if event_type == "sell_like":
             gross_sell_proceeds += notional
+
+        # Trading ledger:
+        # - buy_like / sell_like (including stable <-> token)
+        # - token <-> token swap_like
+        # - transfer_out only shrinks leftover buy inventory
+        # transfer_in never invents cost basis.
+        # ETH/WETH <-> stable is cash conversion and is skipped here.
+        token_swap = event_type == "swap_like" and token_trade
+        if event_type not in {"buy_like", "sell_like", "transfer_out"} and not token_swap:
+            continue
 
         outgoing_tokens = [
             leg
@@ -602,74 +740,77 @@ def compute_fifo_pnl(
             for leg in incoming
             if asset_kind(str(leg.get("asset", ""))) == "token"
         ]
-        consumed_rows = []
-        for leg in outgoing_tokens:
-            asset = str(leg.get("asset", "")).lower()
-            quantity = float(leg.get("amount", 0.0) or 0.0)
-            symbols[asset] = str(leg.get("symbol", ""))
-            decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
-            result = consume(asset, quantity)
-            consumed_rows.append(result)
-            if result["unknown_quantity"] > 1e-15 and not token_trade:
-                unknown_inventory_outflow_count += 1
 
-        if token_trade and outgoing_tokens:
-            sold_quantity = sum(
-                row["requested_quantity"] for row in consumed_rows
-            )
-            known_quantity = sum(
-                row["known_quantity"] for row in consumed_rows
-            )
-            known_cost = sum(
-                row["known_cost_usd"] for row in consumed_rows
-            )
-            coverage = (
-                min(known_quantity / sold_quantity, 1.0)
-                if sold_quantity > 1e-15
-                else 0.0
-            )
-            total_sale_notional += notional
-            covered_sale_notional += notional * coverage
-            known_trade_pnl = (
-                notional * coverage - known_cost - gas_usd * coverage
-            )
-            known_realized += known_trade_pnl
-            if coverage < 1.0 - 1e-12:
-                unknown_basis_sale_count += 1
-            else:
-                if known_trade_pnl > 0:
-                    wins += 1
-                elif known_trade_pnl < 0:
-                    losses += 1
+        if event_type in {"sell_like", "transfer_out"} or token_swap:
+            consumed_rows = []
+            for leg in outgoing_tokens:
+                asset = str(leg.get("asset", "")).lower()
+                quantity = float(leg.get("amount", 0.0) or 0.0)
+                symbols[asset] = str(leg.get("symbol", ""))
+                decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
+                result = consume(asset, quantity)
+                consumed_rows.append(result)
+                if (
+                    event_type == "transfer_out"
+                    and result["unknown_quantity"] > 1e-15
+                ):
+                    unknown_inventory_outflow_count += 1
 
-        priced_total = sum(
-            float(leg.get("usd_value", 0.0) or 0.0)
-            for leg in incoming_tokens
-        )
-        known_acquisition = (
-            event.get("event_type") == "buy_like"
-            or (
-                event.get("event_type") == "swap_like"
-                and bool(outgoing_tokens)
+            if (
+                event_type in {"sell_like"} or token_swap
+            ) and outgoing_tokens:
+                sold_quantity = sum(
+                    row["requested_quantity"] for row in consumed_rows
+                )
+                known_quantity = sum(
+                    row["known_quantity"] for row in consumed_rows
+                )
+                known_cost = sum(
+                    row["known_cost_usd"] for row in consumed_rows
+                )
+                coverage = (
+                    min(known_quantity / sold_quantity, 1.0)
+                    if sold_quantity > 1e-15
+                    else 0.0
+                )
+                total_sale_notional += notional
+                covered_sale_notional += notional * coverage
+                known_trade_pnl = (
+                    notional * coverage - known_cost - gas_usd * coverage
+                )
+                known_realized += known_trade_pnl
+                if coverage < 1.0 - 1e-12:
+                    unknown_basis_sale_count += 1
+                else:
+                    if known_trade_pnl > 0:
+                        wins += 1
+                    elif known_trade_pnl < 0:
+                        losses += 1
+
+        if event_type == "buy_like" or token_swap:
+            priced_total = sum(
+                float(leg.get("usd_value", 0.0) or 0.0)
+                for leg in incoming_tokens
             )
-        )
-        for leg in incoming_tokens:
-            asset = str(leg.get("asset", "")).lower()
-            quantity = float(leg.get("amount", 0.0) or 0.0)
-            market_value = float(leg.get("usd_value", 0.0) or 0.0)
-            weight = (
-                market_value / priced_total
-                if priced_total > 0
-                else 1 / max(len(incoming_tokens), 1)
-            )
-            symbols[asset] = str(leg.get("symbol", ""))
-            decimals_by_asset[asset] = int(leg.get("decimals", 18) or 18)
-            cost = (
-                (notional + gas_usd) * weight
-                if known_acquisition and notional > 0
-                else None
-            )
-            add_lot(asset, quantity, cost)
+            for leg in incoming_tokens:
+                asset = str(leg.get("asset", "")).lower()
+                quantity = float(leg.get("amount", 0.0) or 0.0)
+                market_value = float(leg.get("usd_value", 0.0) or 0.0)
+                weight = (
+                    market_value / priced_total
+                    if priced_total > 0
+                    else 1 / max(len(incoming_tokens), 1)
+                )
+                symbols[asset] = str(leg.get("symbol", ""))
+                decimals_by_asset[asset] = int(
+                    leg.get("decimals", 18) or 18
+                )
+                cost = (
+                    (notional + gas_usd) * weight
+                    if notional > 0
+                    else None
+                )
+                add_lot(asset, quantity, cost)
 
     open_positions = {}
     inventory_matched = 0
@@ -699,20 +840,16 @@ def compute_fifo_pnl(
         elif unknown_quantity <= 1e-12:
             unrealized += quantity * price - known_cost
         actual_balance = current_balances.get(asset)
-        if asset in current_balances:
+        # Trading inventory is buy/sell residual, not full wallet holdings.
+        if asset in current_balances and actual_balance is not None:
             tolerance = max(
                 10 ** (-min(decimals_by_asset.get(asset, 18), 12)),
-                abs(actual_balance or 0.0) * 1e-9,
+                abs(actual_balance) * 1e-9,
             )
-            if (
-                actual_balance is not None
-                and abs(quantity - actual_balance) <= tolerance
-            ):
+            if abs(quantity - actual_balance) <= tolerance:
                 inventory_matched += 1
             else:
                 inventory_mismatch_count += 1
-        else:
-            inventory_mismatch_count += 1
         open_positions[asset] = {
             "quantity": quantity,
             "known_cost_usd": known_cost,
@@ -732,30 +869,22 @@ def compute_fifo_pnl(
         if open_positions
         else 1.0
     )
-    pnl_valid = (
+    # Completeness of the trading sample: every sell_like had buy_like basis.
+    pnl_complete = (
         basis_coverage >= 1.0 - 1e-12
-        and inventory_mismatch_count == 0
-        and unknown_open_position_count == 0
-        and unpriced_open_position_count == 0
+        and unknown_basis_sale_count == 0
     )
-    total = known_realized + unrealized if pnl_valid else None
     resolved_trades = wins + losses
+    total = known_realized + unrealized
     return {
-        "realized_pnl_usd": known_realized if pnl_valid else None,
-        "unrealized_pnl_usd": unrealized if pnl_valid else None,
+        "realized_pnl_usd": known_realized,
+        "unrealized_pnl_usd": unrealized,
         "total_pnl_usd": total,
-        "roi": (
-            total / gross_buy_spend
-            if pnl_valid and gross_buy_spend and total is not None
-            else 0.0 if pnl_valid else None
-        ),
-        "wins": wins if pnl_valid else None,
-        "losses": losses if pnl_valid else None,
-        "winrate": (
-            wins / resolved_trades
-            if pnl_valid and resolved_trades
-            else 0.0 if pnl_valid else None
-        ),
+        "roi": total / gross_buy_spend if gross_buy_spend else 0.0,
+        "wins": wins,
+        "losses": losses,
+        "winrate": wins / resolved_trades if resolved_trades else 0.0,
+        "covered_sell_count": resolved_trades,
         "gross_buy_spend_usd": gross_buy_spend,
         "gross_sell_proceeds_usd": gross_sell_proceeds,
         "net_cash_deployed_usd": (
@@ -776,9 +905,10 @@ def compute_fifo_pnl(
         "inventory_mismatch_count": inventory_mismatch_count,
         "unknown_open_position_count": unknown_open_position_count,
         "unpriced_open_position_count": unpriced_open_position_count,
-        "pnl_valid": pnl_valid,
+        "pnl_valid": pnl_complete,
         "open_positions": open_positions,
     }
+
 
 
 class FeatureCalculator:
@@ -832,14 +962,17 @@ class FeatureCalculator:
             wallet.chain_id,
         )
         gas_by_hash = {}
+        eth_price_by_day: dict[int, float] = {}
         for row in normals:
             if row.from_address.lower() != wallet.address.lower():
                 continue
+            day = row.timestamp // _PRICE_BUCKET_SECONDS
+            if day not in eth_price_by_day:
+                eth_price_by_day[day] = resolver.resolve(
+                    NATIVE_ADDRESS, "ETH", 18, row.timestamp, row.block_number
+                ) or 0.0
             gas_eth = safe_int(row.gas_used) * safe_int(row.gas_price) / 10**18
-            eth_price = resolver.resolve(
-                NATIVE_ADDRESS, "ETH", 18, row.timestamp, row.block_number
-            )
-            gas_by_hash[row.tx_hash] = gas_eth * (eth_price or 0.0)
+            gas_by_hash[row.tx_hash] = gas_eth * eth_price_by_day[day]
         events = derive_events(grouped, resolver, gas_by_hash)
         token_trades = [
             event
@@ -856,6 +989,10 @@ class FeatureCalculator:
         current_balances: dict[str, float | None] = {}
         now = int(datetime.now(timezone.utc).timestamp())
         for asset, position in pnl["open_positions"].items():
+            # Skip RPC/price work for junk tokens; trusted notionals drive PnL.
+            if asset_kind(str(asset)) == "token":
+                current_balances[asset] = None
+                continue
             price = resolver.resolve(
                 asset,
                 position.get("symbol", ""),
@@ -952,6 +1089,7 @@ class FeatureCalculator:
                 "wins",
                 "losses",
                 "winrate",
+                "covered_sell_count",
                 "gross_buy_spend_usd",
                 "gross_sell_proceeds_usd",
                 "net_cash_deployed_usd",

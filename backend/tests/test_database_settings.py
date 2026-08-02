@@ -15,6 +15,7 @@ def test_database_creates_six_domain_files(tmp_path: Path) -> None:
     database.initialize()
 
     assert {path.name for path in tmp_path.glob("*.sqlite3")} == {
+        "hub.sqlite3",
         "keys.sqlite3",
         "wallets.sqlite3",
         "events.sqlite3",

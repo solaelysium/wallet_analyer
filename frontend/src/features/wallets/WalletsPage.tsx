@@ -14,12 +14,14 @@ import { JobCard } from '../../components/JobCard'
 import { EmptyState, ErrorState, LoadingState } from '../../components/States'
 import { PreviewModal } from './PreviewModal'
 import { JobLogsModal } from './JobLogsModal'
+import { JobSummaryModal } from './JobSummaryModal'
 import {
   createManualSource,
   getAggregateStats,
   parseImportFile,
   type LocalImportSource,
 } from './importHelpers'
+import { formatDate } from '../../utils/datetime'
 
 export function WalletsPage() {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -29,9 +31,10 @@ export function WalletsPage() {
   const [importError, setImportError] = useState('')
   const [preview, setPreview] = useState<WalletPreview | null>(null)
   const [excludedAddresses, setExcludedAddresses] = useState<Set<string>>(new Set())
-  const [batchName, setBatchName] = useState(`Пакет кошельков ${new Date().toLocaleDateString('ru-RU')}`)
+  const [batchName, setBatchName] = useState(`Пакет кошельков ${formatDate(new Date())}`)
   const [chain, setChain] = useState('ethereum')
   const [logJob, setLogJob] = useState<Job | null>(null)
+  const [summaryJob, setSummaryJob] = useState<Job | null>(null)
   const [deleteJob, setDeleteJob] = useState<Job | null>(null)
   const stats = getAggregateStats(sources)
 
@@ -218,6 +221,7 @@ export function WalletsPage() {
                 job={job}
                 onAction={(action) => controlMutation.mutate({ id: job.id, action })}
                 onViewLogs={() => setLogJob(job)}
+                onViewSummary={() => setSummaryJob(job)}
                 onDelete={
                   job.importId !== null && !['queued', 'running', 'cancelling'].includes(job.status)
                     ? () => deleteHistory(job)
@@ -252,6 +256,7 @@ export function WalletsPage() {
         confirmError={createMutation.error?.message}
       />
       <JobLogsModal job={logJob} onClose={() => setLogJob(null)} />
+      <JobSummaryModal job={summaryJob} onClose={() => setSummaryJob(null)} />
       <ConfirmModal
         open={deleteJob !== null}
         title="Удаление пакета из истории"

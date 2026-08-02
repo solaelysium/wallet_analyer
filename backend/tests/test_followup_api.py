@@ -92,7 +92,8 @@ def test_retry_requeues_failed_item_and_rejects_duplicate_start(app_client) -> N
     assert duplicate.status_code in {409, 422}
     assert wait_for_job(client, job_id) == "completed"
     detail = client.get(f"/api/jobs/{job_id}").json()
-    assert detail["items"][0]["attempts"] == 2
+    # Initial collect+features, then retry runs features again.
+    assert detail["items"][0]["attempts"] == 3
     assert detail["items"][0]["error"] is None
 
 
@@ -106,7 +107,8 @@ def test_recalculate_reprocesses_completed_wallets(app_client) -> None:
     assert response.status_code == 200
     assert wait_for_job(client, job_id) == "completed"
     detail = client.get(f"/api/jobs/{job_id}").json()
-    assert detail["items"][0]["attempts"] == 2
+    # Two full waves: collect+features, then collect+features again.
+    assert detail["items"][0]["attempts"] == 4
     assert client.get("/api/features").json()["items"][0]["version"] == (
             "wallet_features.v4"
     )

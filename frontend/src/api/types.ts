@@ -52,6 +52,25 @@ export interface Job {
   progressTotal: number
 }
 
+export interface JobSummaryWallet {
+  id: number
+  address: string
+  state: string
+  eventCount: number | null
+  error: string | null
+}
+
+export interface JobSummary {
+  total: number
+  queued: number
+  running: number
+  completed: number
+  skipped: number
+  failed: number
+  cancelled: number
+  wallets: JobSummaryWallet[]
+}
+
 export interface FeatureRow {
   walletId: number
   address: string

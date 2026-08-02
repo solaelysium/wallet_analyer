@@ -9,22 +9,48 @@ from .config import Settings
 from .key_pool import KeyPool, RateLimitedError
 
 
+class TooManyTransactionsError(Exception):
+    def __init__(self, count: int) -> None:
+        self.count = count
+        super().__init__(f"Wallet has more than allowed transactions ({count})")
+
+
+class ResultWindowTooLargeError(RuntimeError):
+    """Etherscan page*offset window exceeded; caller should slide startblock."""
+
+
+# Etherscan account API: page * offset must be <= 10000 per request window.
+ETHERSCAN_MAX_RESULT_WINDOW = 10_000
+
+
 class ExplorerProvider(ABC):
     @abstractmethod
     def normal_transactions(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
         raise NotImplementedError
 
     @abstractmethod
     def internal_transactions(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
         raise NotImplementedError
 
     @abstractmethod
     def token_transfers(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
         raise NotImplementedError
 
@@ -115,6 +141,8 @@ class EtherscanV2Provider(ExplorerProvider):
                 return []
             if "rate limit" in lowered or "max rate" in lowered:
                 raise RateLimitedError(message.strip())
+            if "result window is too large" in lowered:
+                raise ResultWindowTooLargeError(message.strip())
             raise RuntimeError(f"Etherscan error: {message.strip()}")
         if not isinstance(result, list):
             raise RuntimeError("Etherscan returned an unexpected response")
@@ -126,27 +154,55 @@ class EtherscanV2Provider(ExplorerProvider):
         address: str,
         cancel_check=None,
         start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
+        if max_rows is not None and max_rows < 0:
+            raise TooManyTransactionsError(0)
         page = 1
+        cursor_block = max(0, int(start_block))
         rows: list[dict] = []
         seen: set[tuple] = set()
         while True:
             if cancel_check:
                 cancel_check()
-            chunk = self.key_pool.call(
-                "etherscan",
-                self._request,
-                {
-                    "module": "account",
-                    "action": action,
-                    "address": address,
-                    "startblock": start_block,
-                    "endblock": 99_999_999,
-                    "page": page,
-                    "offset": self.page_size,
-                    "sort": "asc",
-                },
-            )
+            if max_rows is not None and len(rows) > max_rows:
+                raise TooManyTransactionsError(len(rows))
+            if page * self.page_size > ETHERSCAN_MAX_RESULT_WINDOW:
+                if not rows:
+                    break
+                next_block = int(rows[-1].get("blockNumber") or cursor_block)
+                if next_block <= cursor_block:
+                    next_block = cursor_block + 1
+                cursor_block = next_block
+                page = 1
+                continue
+            try:
+                chunk = self.key_pool.call(
+                    "etherscan",
+                    self._request,
+                    {
+                        "module": "account",
+                        "action": action,
+                        "address": address,
+                        "startblock": cursor_block,
+                        "endblock": 99_999_999,
+                        "page": page,
+                        "offset": self.page_size,
+                        "sort": "asc",
+                    },
+                )
+            except ResultWindowTooLargeError:
+                if not rows:
+                    raise TooManyTransactionsError(
+                        ETHERSCAN_MAX_RESULT_WINDOW + 1
+                    )
+                next_block = int(rows[-1].get("blockNumber") or cursor_block)
+                if next_block <= cursor_block:
+                    next_block = cursor_block + 1
+                cursor_block = next_block
+                page = 1
+                continue
+            added = 0
             for row in chunk:
                 identity = (
                     row.get("hash"),
@@ -156,25 +212,56 @@ class EtherscanV2Provider(ExplorerProvider):
                 if identity not in seen:
                     seen.add(identity)
                     rows.append(row)
+                    added += 1
+                    if max_rows is not None and len(rows) > max_rows:
+                        raise TooManyTransactionsError(len(rows))
             if len(chunk) < self.page_size:
                 break
+            if added == 0:
+                # Full page of duplicates from an overlapping block window.
+                last_block = int(
+                    chunk[-1].get("blockNumber") or cursor_block
+                )
+                cursor_block = max(cursor_block + 1, last_block + 1)
+                page = 1
+                continue
+            if max_rows is not None and len(rows) >= max_rows:
+                raise TooManyTransactionsError(len(rows) + 1)
             page += 1
         return rows
 
     def normal_transactions(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
-        return self._paged("txlist", address, cancel_check, start_block)
+        return self._paged(
+            "txlist", address, cancel_check, start_block, max_rows
+        )
 
     def internal_transactions(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
-        return self._paged("txlistinternal", address, cancel_check, start_block)
+        return self._paged(
+            "txlistinternal", address, cancel_check, start_block, max_rows
+        )
 
     def token_transfers(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
-        return self._paged("tokentx", address, cancel_check, start_block)
+        return self._paged(
+            "tokentx", address, cancel_check, start_block, max_rows
+        )
 
 
 class InfuraProvider(RpcProvider):

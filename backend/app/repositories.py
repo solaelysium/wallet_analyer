@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from sqlalchemy import Select, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -14,6 +18,9 @@ from .models import (
     utcnow,
 )
 from .token_rules import is_suspicious_token_symbol
+
+
+_DB_WRITE_LOCK = threading.RLock()
 
 
 class Repository:
@@ -67,30 +74,65 @@ class TokenRepository(Repository):
         name: str | None,
         decimals: int,
     ) -> Token:
+        normalized = address.lower()
         valid_decimals = decimals if 0 <= decimals <= 255 else None
+        resolved_decimals = valid_decimals if valid_decimals is not None else 18
+        now = utcnow()
+        values = {
+            "chain_id": chain_id,
+            "address": normalized,
+            "symbol": symbol,
+            "name": name,
+            "decimals": resolved_decimals,
+            "suspicious": is_suspicious_token_symbol(symbol),
+            "created_at": now,
+            "updated_at": now,
+        }
+        insert_stmt = sqlite_insert(Token).values(**values)
+        updates = {
+            "updated_at": now,
+            "suspicious": insert_stmt.excluded.suspicious,
+        }
+        if symbol:
+            updates["symbol"] = insert_stmt.excluded.symbol
+        if name:
+            updates["name"] = insert_stmt.excluded.name
+        if valid_decimals is not None:
+            updates["decimals"] = insert_stmt.excluded.decimals
+        upsert = insert_stmt.on_conflict_do_update(
+            index_elements=["chain_id", "address"],
+            set_=updates,
+        )
+        execute_with_busy_retry(self.session, upsert)
         token = self.session.scalar(
             select(Token).where(
                 Token.chain_id == chain_id,
-                Token.address == address.lower(),
+                Token.address == normalized,
             )
         )
         if token is None:
-            token = Token(
-                chain_id=chain_id,
-                address=address.lower(),
-                symbol=symbol,
-                name=name,
-                decimals=valid_decimals if valid_decimals is not None else 18,
-                suspicious=is_suspicious_token_symbol(symbol),
-            )
-            self.add(token)
-        else:
-            token.symbol = symbol or token.symbol
-            token.name = name or token.name
-            if valid_decimals is not None:
-                token.decimals = valid_decimals
-            token.suspicious = is_suspicious_token_symbol(token.symbol)
+            raise RuntimeError(f"Token upsert failed for {normalized}")
         return token
+
+    def ensure_many(
+        self,
+        chain_id: int,
+        specs: list[dict],
+    ) -> dict[str, Token]:
+        """Upsert unique tokens and return address -> Token map."""
+        resolved: dict[str, Token] = {}
+        for spec in specs:
+            address = str(spec["address"]).lower()
+            if address in resolved:
+                continue
+            resolved[address] = self.get_or_create(
+                chain_id,
+                address,
+                spec.get("symbol"),
+                spec.get("name"),
+                int(spec.get("decimals", 18)),
+            )
+        return resolved
 
 
 class JobRepository(Repository):
@@ -111,28 +153,48 @@ class JobRepository(Repository):
         done = self.session.scalar(
             select(func.count(JobItem.id)).where(
                 JobItem.job_id == job_id,
-                JobItem.state.in_(("completed", "failed", "cancelled")),
+                JobItem.state.in_(("completed", "failed", "cancelled", "skipped")),
             )
         )
         job.progress_done = int(done or 0)
-        if job.progress_done >= job.progress_total:
-            failures = self.session.scalar(
-                select(func.count(JobItem.id)).where(
-                    JobItem.job_id == job_id, JobItem.state == "failed"
-                )
+        if job.progress_done < job.progress_total:
+            return
+        failures = self.session.scalar(
+            select(func.count(JobItem.id)).where(
+                JobItem.job_id == job_id, JobItem.state == "failed"
             )
-            cancelled = self.session.scalar(
-                select(func.count(JobItem.id)).where(
-                    JobItem.job_id == job_id, JobItem.state == "cancelled"
-                )
+        )
+        cancelled = self.session.scalar(
+            select(func.count(JobItem.id)).where(
+                JobItem.job_id == job_id, JobItem.state == "cancelled"
             )
-            if cancelled and job.cancel_requested:
-                job.state = "cancelled"
-            elif failures:
-                job.state = "completed_with_errors"
-            else:
-                job.state = "completed"
+        )
+        if cancelled and job.cancel_requested:
+            job.state = "cancelled"
             job.finished_at = utcnow()
+            return
+        parameters = job.parameters or {}
+        phase = str(parameters.get("phase", "collection"))
+        if (
+            job.kind == "collection"
+            and phase != "features"
+            and not job.cancel_requested
+        ):
+            completed = self.session.scalar(
+                select(func.count(JobItem.id)).where(
+                    JobItem.job_id == job_id, JobItem.state == "completed"
+                )
+            )
+            if completed:
+                # Collection wave done; features phase will restart the job.
+                job.state = "running"
+                job.finished_at = None
+                return
+        if failures:
+            job.state = "completed_with_errors"
+        else:
+            job.state = "completed"
+        job.finished_at = utcnow()
 
 
 class FeatureRepository(Repository):
@@ -182,8 +244,25 @@ def log_event(
     return row
 
 
+def execute_with_busy_retry(session: Session, statement, attempts: int = 12):
+    delay = 0.05
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return session.execute(statement)
+        except OperationalError as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.7, 1.5)
+    assert last_error is not None
+    raise last_error
+
+
 def sqlite_upsert(session: Session, model: type, values: dict, keys: list[str]) -> None:
     statement = sqlite_insert(model).values(**values)
     updates = {column: value for column, value in values.items() if column not in keys}
     statement = statement.on_conflict_do_update(index_elements=keys, set_=updates)
-    session.execute(statement)
+    execute_with_busy_retry(session, statement)

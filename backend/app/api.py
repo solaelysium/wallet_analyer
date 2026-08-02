@@ -4,7 +4,7 @@ import asyncio
 import csv
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
@@ -53,7 +53,13 @@ def get_session(request: Request):
 
 
 def iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
 
 
 SENSITIVE_LOG_KEYS = {
@@ -457,7 +463,9 @@ def wallet_delete(
                 session.scalar(
                     select(func.count(JobItem.id)).where(
                         JobItem.job_id == job_id,
-                        JobItem.state.in_(("completed", "failed", "cancelled")),
+                        JobItem.state.in_(
+                            ("completed", "failed", "cancelled", "skipped")
+                        ),
                     )
                 ) or 0
             )
@@ -508,8 +516,41 @@ def job_detail(job_id: int, session: Session = Depends(get_session)) -> dict:
         .where(JobItem.job_id == job_id)
         .order_by(JobItem.id)
     ).all()
-    return serialize_job(job) | {
-        "items": [
+    wallet_ids = [wallet.id for _, wallet in items]
+    event_counts: dict[int, int] = {}
+    if wallet_ids:
+        for model in (NormalTransaction, InternalTransaction, TokenTransfer):
+            rows = session.execute(
+                select(model.wallet_id, func.count(model.id))
+                .where(model.wallet_id.in_(wallet_ids))
+                .group_by(model.wallet_id)
+            ).all()
+            for wallet_id, count in rows:
+                event_counts[int(wallet_id)] = event_counts.get(int(wallet_id), 0) + int(
+                    count
+                )
+    counts = {
+        "total": 0,
+        "queued": 0,
+        "running": 0,
+        "completed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    serialized_items = []
+    for item, wallet in items:
+        counts["total"] += 1
+        if item.state in counts:
+            counts[item.state] += 1
+        checkpoint = item.checkpoint or {}
+        stored_count = checkpoint.get("event_count")
+        event_count = (
+            int(stored_count)
+            if isinstance(stored_count, (int, float))
+            else event_counts.get(wallet.id)
+        )
+        serialized_items.append(
             {
                 "id": item.id,
                 "wallet_id": item.wallet_id,
@@ -518,12 +559,15 @@ def job_detail(job_id: int, session: Session = Depends(get_session)) -> dict:
                 "stage": item.stage,
                 "attempts": item.attempts,
                 "error": item.error,
-                "checkpoint": item.checkpoint,
+                "event_count": event_count,
+                "checkpoint": checkpoint,
                 "started_at": iso(item.started_at),
                 "finished_at": iso(item.finished_at),
             }
-            for item, wallet in items
-        ]
+        )
+    return serialize_job(job) | {
+        "summary": counts,
+        "items": serialized_items,
     }
 
 
@@ -564,6 +608,15 @@ def job_recalculate(job_id: int, request: Request) -> dict:
         return serialize_job(
             request.app.state.jobs.resume(job_id, reprocess_completed=True)
         )
+    except ValueError as exc:
+        status = 409 if "актив" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@router.post("/api/jobs/{job_id}/advance-features")
+def job_advance_features(job_id: int, request: Request) -> dict:
+    try:
+        return serialize_job(request.app.state.jobs.advance_to_features(job_id))
     except ValueError as exc:
         status = 409 if "актив" in str(exc) else 422
         raise HTTPException(status_code=status, detail=str(exc)) from exc

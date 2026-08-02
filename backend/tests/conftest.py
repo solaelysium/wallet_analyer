@@ -22,21 +22,33 @@ from app.providers import (
 
 class FakeExplorer(ExplorerProvider):
     def normal_transactions(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
         if cancel_check:
             cancel_check()
         return []
 
     def internal_transactions(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
         if cancel_check:
             cancel_check()
         return []
 
     def token_transfers(
-        self, address: str, cancel_check=None, start_block: int = 0
+        self,
+        address: str,
+        cancel_check=None,
+        start_block: int = 0,
+        max_rows: int | None = None,
     ) -> list[dict]:
         if cancel_check:
             cancel_check()

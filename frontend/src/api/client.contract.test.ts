@@ -170,7 +170,7 @@ describe('backend API contract adapters', () => {
     expect(page.columns.find((column) => column.id === 'realized_pnl_usd')?.type).toBe('currency')
   })
 
-  it('excludes nullable strict PnL from the clustering dataset', async () => {
+  it('keeps confirmed PnL metrics available for clustering when numeric', async () => {
     const item = {
       snapshot_id: 10,
       wallet_id: 3,
@@ -180,10 +180,15 @@ describe('backend API contract adapters', () => {
       created_at: '2026-07-29T20:00:00+00:00',
       features: {
         total_token_trade_volume_usd: 9000,
-        realized_pnl_usd: null,
-        roi: null,
+        realized_pnl_usd: -120.5,
+        winrate: 0.4,
+        covered_sell_count: 10,
+        roi: -0.05,
       },
-      quality: { pnl_valid: false },
+      quality: {
+        pnl_valid: false,
+        pnl_basis_coverage_ratio: 0.45,
+      },
     }
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       items: [item],
@@ -197,8 +202,9 @@ describe('backend API contract adapters', () => {
 
     expect(dataset?.version).toBe('wallet_features.v4')
     expect(dataset?.numericFeatures).toContain('total_token_trade_volume_usd')
-    expect(dataset?.numericFeatures).not.toContain('realized_pnl_usd')
-    expect(dataset?.numericFeatures).not.toContain('roi')
+    expect(dataset?.numericFeatures).toContain('realized_pnl_usd')
+    expect(dataset?.numericFeatures).toContain('winrate')
+    expect(dataset?.numericFeatures).toContain('covered_sell_count')
   })
 
   it('fetches completed cluster details and transforms assignments and profile objects', async () => {

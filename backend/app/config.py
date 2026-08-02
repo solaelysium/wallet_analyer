@@ -42,9 +42,9 @@ class Settings:
         self.provider_cooldown_seconds = float(
             values.pop("provider_cooldown_seconds", 30.0)
         )
-        self.etherscan_rps = float(values.pop("etherscan_rps", 4.0))
+        self.etherscan_rps = float(values.pop("etherscan_rps", 3.0))
         self.infura_rps = float(values.pop("infura_rps", 8.0))
-        self.coingecko_rps = float(values.pop("coingecko_rps", 1.0))
+        self.coingecko_rps = float(values.pop("coingecko_rps", 1.5))
         self.key_concurrency = max(1, int(values.pop("key_concurrency", 2)))
         self.infura_api_keys = list(values.pop("infura_api_keys", []))
         self.etherscan_api_keys = list(values.pop("etherscan_api_keys", []))

@@ -13,6 +13,7 @@ import type {
   FeatureRow,
   Job,
   JobStatus,
+  JobSummary,
   LogPage,
   LogQuery,
   ProviderHealth,
@@ -62,7 +63,23 @@ interface RawJob {
   created_at: string
   started_at: string | null
   finished_at: string | null
-  items?: { state: string; stage: string | null; error: string | null }[]
+  items?: {
+    id?: number
+    state: string
+    stage: string | null
+    error: string | null
+    address?: string
+    event_count?: number | null
+  }[]
+  summary?: {
+    total: number
+    queued: number
+    running: number
+    completed: number
+    skipped: number
+    failed: number
+    cancelled: number
+  }
 }
 
 interface RawImport {
@@ -219,6 +236,7 @@ const stageLabels: Record<string, string> = {
   completed: 'Завершено',
   completed_with_errors: 'Завершено с ошибками',
   failed: 'Ошибка',
+  skipped: 'Пропущено',
   cancelled: 'Отменено',
   cancelling: 'Отменяется',
   pending: 'Ожидание',
@@ -232,6 +250,11 @@ const stageLabels: Record<string, string> = {
   persisting: 'Сохранение результатов',
   stopping: 'Остановка',
   rpc: 'Запросы RPC',
+  normal_transactions: 'Обычные транзакции',
+  internal_transactions: 'Внутренние транзакции',
+  token_transfers: 'Токен-трансферы',
+  collected: 'Данные собраны',
+  features: 'Расчёт признаков',
 }
 
 function stageLabel(value: string) {
@@ -531,6 +554,40 @@ export async function getWalletJobs(): Promise<Job[]> {
   return detailed.map((job) =>
     normalizeJob(job, job.wallet_import_id ? imports.get(job.wallet_import_id)?.name : undefined),
   )
+}
+
+export async function getJobSummary(id: string): Promise<JobSummary> {
+  const raw = await request<RawJob>(`/jobs/${encodeURIComponent(id)}`)
+  const counts = {
+    total: raw.summary?.total ?? raw.items?.length ?? raw.progress_total ?? 0,
+    queued: raw.summary?.queued ?? 0,
+    running: raw.summary?.running ?? 0,
+    completed: raw.summary?.completed ?? 0,
+    skipped: raw.summary?.skipped ?? 0,
+    failed: raw.summary?.failed ?? 0,
+    cancelled: raw.summary?.cancelled ?? 0,
+  }
+  if (!raw.summary && raw.items) {
+    counts.total = raw.items.length
+    for (const item of raw.items) {
+      if (item.state === 'queued') counts.queued += 1
+      else if (item.state === 'running') counts.running += 1
+      else if (item.state === 'completed') counts.completed += 1
+      else if (item.state === 'skipped') counts.skipped += 1
+      else if (item.state === 'failed') counts.failed += 1
+      else if (item.state === 'cancelled') counts.cancelled += 1
+    }
+  }
+  return {
+    ...counts,
+    wallets: (raw.items ?? []).map((item, index) => ({
+      id: item.id ?? index,
+      address: item.address ?? '—',
+      state: item.state,
+      eventCount: typeof item.event_count === 'number' ? item.event_count : null,
+      error: item.error,
+    })),
+  }
 }
 
 export async function controlWalletJob(

@@ -328,7 +328,7 @@ def confirm_import(
         state="queued",
         wallet_import_id=batch.id,
         progress_total=len(members),
-        parameters={"chain": chain.slug},
+        parameters={"chain": chain.slug, "phase": "collection"},
     )
     session.add(job)
     session.flush()

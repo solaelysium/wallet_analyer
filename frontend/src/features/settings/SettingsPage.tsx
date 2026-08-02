@@ -27,6 +27,7 @@ import type {
   RuntimeSettingsUpdate,
 } from '../../api/types'
 import { EmptyState, ErrorState, LoadingState } from '../../components/States'
+import { formatDateTime } from '../../utils/datetime'
 
 const services: { id: ProviderService; label: string; purpose: string }[] = [
   { id: 'etherscan', label: 'Etherscan', purpose: 'Транзакции и переводы токенов' },
@@ -38,7 +39,7 @@ const emptyKey: ApiKeyCreate = { service: 'etherscan', label: '', value: '' }
 
 function dateLabel(value: string | null) {
   if (!value) return 'Никогда'
-  return new Date(value).toLocaleString('ru-RU')
+  return formatDateTime(value)
 }
 
 function KeyRow({

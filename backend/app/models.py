@@ -64,9 +64,9 @@ class AppSettings(Base, TimestampMixin):
     provider_timeout_seconds: Mapped[float] = mapped_column(Float, default=30.0)
     provider_max_retries: Mapped[int] = mapped_column(Integer, default=4)
     provider_cooldown_seconds: Mapped[float] = mapped_column(Float, default=30.0)
-    etherscan_rps: Mapped[float] = mapped_column(Float, default=4.0)
+    etherscan_rps: Mapped[float] = mapped_column(Float, default=3.0)
     infura_rps: Mapped[float] = mapped_column(Float, default=8.0)
-    coingecko_rps: Mapped[float] = mapped_column(Float, default=1.0)
+    coingecko_rps: Mapped[float] = mapped_column(Float, default=1.5)
     key_concurrency: Mapped[int] = mapped_column(Integer, default=2)
 
 

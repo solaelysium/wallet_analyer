@@ -1,6 +1,6 @@
-import { CircleStop, Play, RotateCcw, ScrollText, Trash2 } from 'lucide-react'
+import { CircleStop, ClipboardList, Play, RotateCcw, ScrollText, Trash2 } from 'lucide-react'
 import type { Job } from '../api/types'
-import { formatEta, formatRelativeTime } from '../utils/jobFormatting'
+import { formatRelativeTime } from '../utils/jobFormatting'
 
 interface JobCardProps {
   job: Job
@@ -8,6 +8,7 @@ interface JobCardProps {
   selected?: boolean
   onSelect?: () => void
   onViewLogs?: () => void
+  onViewSummary?: () => void
   onDelete?: () => void
 }
 
@@ -21,11 +22,20 @@ const statusLabels: Record<Job['status'], string> = {
   cancelling: 'Отменяется',
 }
 
-export function JobCard({ job, onAction, selected, onSelect, onViewLogs, onDelete }: JobCardProps) {
+export function JobCard({
+  job,
+  onAction,
+  selected,
+  onSelect,
+  onViewLogs,
+  onViewSummary,
+  onDelete,
+}: JobCardProps) {
   const canStop = job.status === 'running' || job.status === 'queued'
   const canResume = job.status === 'cancelled'
   const canRetry = job.status === 'failed' || job.status === 'completed_with_errors'
   const canRecalculate = job.status === 'completed' || job.status === 'completed_with_errors'
+  const doneLabel = `${job.progressDone.toLocaleString('ru-RU')} / ${job.progressTotal.toLocaleString('ru-RU')}`
   return (
     <article
       className={`job-card${selected ? ' selected' : ''}`}
@@ -43,16 +53,16 @@ export function JobCard({ job, onAction, selected, onSelect, onViewLogs, onDelet
         <span className={`status-badge ${job.status}`}>{statusLabels[job.status]}</span>
       </div>
       <div className="job-stage">
-        <span>{job.stage}</span>
+        <span>{doneLabel} кошельков</span>
         <span>{Math.round(job.progress)}%</span>
       </div>
-      <div className="progress-track" aria-label={`Выполнено ${Math.round(job.progress)} процентов`}>
+      <div className="progress-track" aria-label={`Обработано ${doneLabel} кошельков`}>
         <span style={{ width: `${Math.min(100, Math.max(0, job.progress))}%` }} />
       </div>
       {job.error && <p className="job-error">{job.error}</p>}
-      {(((canStop || canResume || canRetry || canRecalculate) && onAction) || onViewLogs || onDelete) && (
+      {(((canStop || canResume || canRetry || canRecalculate) && onAction) || onViewLogs || onViewSummary || onDelete) && (
         <div className="job-actions">
-          <span>{canStop ? `Осталось: ${formatEta(job.etaSeconds)}` : ''}</span>
+          <span>{job.stage}</span>
           <div className="job-action-buttons">
             {canStop && onAction && (
               <button type="button" className="text-button danger" onClick={(event) => {
@@ -84,6 +94,14 @@ export function JobCard({ job, onAction, selected, onSelect, onViewLogs, onDelet
                 onAction('recalculate')
               }}>
                 <RotateCcw size={15} /> Пересчитать
+              </button>
+            )}
+            {onViewSummary && (
+              <button type="button" className="text-button" onClick={(event) => {
+                event.stopPropagation()
+                onViewSummary()
+              }}>
+                <ClipboardList size={15} /> Сводка
               </button>
             )}
             {onViewLogs && (

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from .config import SecretBox, Settings, get_settings
 from .models import (
@@ -30,9 +31,13 @@ class Database:
         self.paths = {
             name: self.data_dir / f"{name}.sqlite3" for name in DATABASE_TABLES
         }
+        # File-backed hub + NullPool: memory sqlite:// uses SingletonThreadPool,
+        # which closes in-use connections once unique threads exceed pool_size (5).
+        hub = self.data_dir / "hub.sqlite3"
         self.engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
+            f"sqlite:///{hub.as_posix()}",
+            connect_args={"check_same_thread": False, "timeout": 60},
+            poolclass=NullPool,
             pool_pre_ping=True,
         )
         event.listen(self.engine, "connect", self._configure_sqlite)
@@ -43,7 +48,9 @@ class Database:
     def _configure_sqlite(self, dbapi_connection: object, _: object) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         for name, path in self.paths.items():
             escaped = str(path).replace("'", "''")
             cursor.execute(f"ATTACH DATABASE '{escaped}' AS {name}")
@@ -89,6 +96,8 @@ class Database:
                         native_symbol="ETH",
                     )
                 )
+                session.flush()
+                ethereum = session.scalar(select(Chain).where(Chain.slug == "ethereum"))
             if session.get(AppSettings, 1) is None:
                 session.add(
                     AppSettings(
@@ -103,6 +112,17 @@ class Database:
                         key_concurrency=self.settings.key_concurrency,
                     )
                 )
+            self._seed_common_tokens(session, ethereum.id)
+
+    def _seed_common_tokens(self, session: Session, chain_id: int) -> None:
+        from .repositories import TokenRepository
+        from .token_rules import NATIVE_ADDRESS, STABLECOINS, WETH_ADDRESS
+
+        tokens = TokenRepository(session)
+        tokens.get_or_create(chain_id, NATIVE_ADDRESS, "ETH", "Ether", 18)
+        tokens.get_or_create(chain_id, WETH_ADDRESS, "WETH", "Wrapped Ether", 18)
+        for address, (symbol, decimals) in STABLECOINS.items():
+            tokens.get_or_create(chain_id, address, symbol, symbol, decimals)
 
     def _upgrade_schema(self) -> None:
         with self.engine.begin() as connection:
