@@ -105,7 +105,7 @@ export function FeaturesPage() {
       <section className="panel feature-panel">
         <div className="feature-controls">
           <label className="search-field">
-            <Search size={17} />
+            <Search size={15} />
             <span className="visually-hidden">Поиск адресов</span>
             <input
               type="search"
@@ -115,9 +115,9 @@ export function FeaturesPage() {
             />
           </label>
           <div className="filter-builder">
-            <Filter size={16} />
+            <Filter size={15} />
             <select value={filterColumn} onChange={(event) => setFilterColumn(event.target.value)} aria-label="Столбец фильтра">
-              <option value="">Выберите столбец</option>
+              <option value="">Столбец</option>
               {features.data?.columns
                 .filter((column) => column.source === 'feature' && ['number', 'currency', 'percent'].includes(column.type))
                 .map((column) => <option key={column.id} value={column.id}>{column.label}</option>)}

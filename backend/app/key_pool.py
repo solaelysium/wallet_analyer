@@ -22,6 +22,7 @@ class KeyState:
     concurrency: int
     min_interval: float
     label: str = ""
+    key_id: int | None = None
     active: int = 0
     next_allowed: float = 0.0
     cooldown_until: float = 0.0
@@ -31,6 +32,7 @@ class KeyState:
     rate_limits: int = 0
     last_error: str | None = None
     enabled: bool = True
+    last_persisted_use: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
@@ -60,12 +62,16 @@ class KeyPool:
         rps: dict[str, float] | None = None,
         cooldown_seconds: float = 30.0,
         max_retries: int = 4,
+        usage_persist_interval: float = 15.0,
+        on_key_used=None,
     ) -> None:
         self._condition = threading.Condition()
         self._cursor: dict[str, int] = {}
         self._states: dict[str, list[KeyState]] = {}
         self.cooldown_seconds = cooldown_seconds
         self.max_retries = max_retries
+        self.usage_persist_interval = max(0.0, usage_persist_interval)
+        self._on_key_used = on_key_used
         rps = rps or {}
         for service, values in (keys or {}).items():
             self._states[service] = [
@@ -148,6 +154,8 @@ class KeyPool:
                         )
                     state.label = row.get("label", "")
                     state.enabled = bool(row.get("enabled", True))
+                    raw_id = row.get("id")
+                    state.key_id = int(raw_id) if raw_id is not None else None
                     state.concurrency = max(1, concurrency)
                     state.min_interval = 1.0 / max(
                         rps.get(service, 1.0), 0.01
@@ -230,6 +238,26 @@ class KeyPool:
             or KeyPool._is_rate_limit(exc)
         )
 
+    def set_on_key_used(self, callback) -> None:
+        self._on_key_used = callback
+
+    def _record_use(self, state: KeyState) -> None:
+        callback = self._on_key_used
+        if callback is None:
+            return
+        now = time.monotonic()
+        if (
+            self.usage_persist_interval > 0
+            and now - state.last_persisted_use < self.usage_persist_interval
+        ):
+            return
+        state.last_persisted_use = now
+        try:
+            callback(state.key_id, state.service, state.value)
+        except Exception:
+            # Usage tracking must never break provider calls.
+            return
+
     def call(self, service: str, operation, *args, **kwargs):
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -240,11 +268,14 @@ class KeyPool:
                     result = operation(key, *args, **kwargs)
                 state.successes += 1
                 state.last_error = None
+                self._record_use(state)
                 return result
             except Exception as exc:
                 last_error = exc
                 state.failures += 1
                 state.last_error = f"{type(exc).__name__}: {exc}"[:500]
+                # Still mark the key as used — the request was made.
+                self._record_use(state)
                 if self._is_rate_limit(exc):
                     state.rate_limits += 1
                     state.cooldown_until = time.monotonic() + self.cooldown_seconds

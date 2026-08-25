@@ -23,6 +23,8 @@ const preview: WalletPreview = {
       sourceIndex: null,
       alreadyAnalyzed: true,
       lastAnalyzedAt: '2026-07-30T12:30:00Z',
+      lastAnalysisStatus: 'completed',
+      lastAnalysisError: null,
     },
     {
       address: newAddress,
@@ -32,13 +34,15 @@ const preview: WalletPreview = {
       sourceIndex: null,
       alreadyAnalyzed: false,
       lastAnalyzedAt: null,
+      lastAnalysisStatus: null,
+      lastAnalysisError: null,
     },
   ],
   issues: [],
 }
 
 describe('PreviewModal', () => {
-  it('shows prior analysis and allows selecting individual wallets', async () => {
+  it('shows prior analysis status and allows selecting individual wallets', async () => {
     const user = userEvent.setup()
     const onToggleAddress = vi.fn()
     const onSelectOnlyNew = vi.fn()
@@ -62,7 +66,7 @@ describe('PreviewModal', () => {
     )
 
     expect(screen.getByText('Уже проверялись ранее')).toBeInTheDocument()
-    expect(screen.getByText(/Проверен 30 июл. 2026 г./)).toBeInTheDocument()
+    expect(screen.getByText(/Проверен .* · успешно/)).toBeInTheDocument()
     expect(screen.getByText('Ранее не проверялся')).toBeInTheDocument()
 
     await user.click(screen.getAllByRole('checkbox')[0])
@@ -70,5 +74,47 @@ describe('PreviewModal', () => {
 
     await user.click(screen.getByRole('button', { name: 'Только новые' }))
     expect(onSelectOnlyNew).toHaveBeenCalledOnce()
+  })
+
+  it('shows skipped and failed prior statuses with error details', () => {
+    const mixedPreview: WalletPreview = {
+      ...preview,
+      analyzedCount: 2,
+      entries: [
+        {
+          ...preview.entries[0],
+          lastAnalysisStatus: 'skipped',
+          lastAnalysisError: 'Более 25 000 транзакций',
+        },
+        {
+          ...preview.entries[1],
+          alreadyAnalyzed: true,
+          lastAnalyzedAt: '2026-07-30T13:00:00Z',
+          lastAnalysisStatus: 'failed',
+          lastAnalysisError: 'timeout',
+        },
+      ],
+    }
+
+    render(
+      <PreviewModal
+        preview={mixedPreview}
+        open
+        batchName="Wallet batch"
+        chain="ethereum"
+        onBatchNameChange={vi.fn()}
+        onChainChange={vi.fn()}
+        onClose={vi.fn()}
+        onConfirm={vi.fn()}
+        excludedAddresses={new Set()}
+        onToggleAddress={vi.fn()}
+        onSelectAll={vi.fn()}
+        onSelectOnlyNew={vi.fn()}
+        confirming={false}
+      />,
+    )
+
+    expect(screen.getByText(/пропущено: Более 25 000 транзакций/)).toBeInTheDocument()
+    expect(screen.getByText(/с ошибкой: timeout/)).toBeInTheDocument()
   })
 })

@@ -55,6 +55,40 @@ export function PreviewModal({
     return formatDateTime(value)
   }
 
+  function analysisStatusLabel(status: string | null) {
+    if (status === 'completed') return 'успешно'
+    if (status === 'skipped') return 'пропущено'
+    if (status === 'failed') return 'с ошибкой'
+    if (status === 'cancelled') return 'отменено'
+    if (status === 'running') return 'в работе'
+    if (status === 'queued') return 'в очереди'
+    return status
+  }
+
+  function analysisStatusTone(status: string | null) {
+    if (status === 'completed') return 'success'
+    if (status === 'skipped') return 'warning'
+    if (status === 'failed') return 'danger'
+    if (status === 'cancelled') return 'muted'
+    return 'existing'
+  }
+
+  function priorAnalysisText(entry: WalletPreview['entries'][number]) {
+    if (!entry.alreadyAnalyzed) return 'Ранее не проверялся'
+    const when = analysisDate(entry.lastAnalyzedAt)
+    const status = analysisStatusLabel(entry.lastAnalysisStatus)
+    const base = when
+      ? (status ? `Проверен ${when} · ${status}` : `Проверен ${when}`)
+      : (status ? `Уже проверялся · ${status}` : 'Уже проверялся ранее')
+    if (
+      entry.lastAnalysisError
+      && (entry.lastAnalysisStatus === 'failed' || entry.lastAnalysisStatus === 'skipped')
+    ) {
+      return `${base}: ${entry.lastAnalysisError}`
+    }
+    return base
+  }
+
   return (
     <Modal
       title="Проверка пакета кошельков"
@@ -130,10 +164,14 @@ export function PreviewModal({
                     {entry.source}, строка {entry.row}
                     {entry.sourceIndex !== null ? ` · index ${entry.sourceIndex}` : ''}
                   </span>
-                  <span className={entry.alreadyAnalyzed ? 'analysis-status existing' : 'analysis-status'}>
-                    {entry.alreadyAnalyzed
-                      ? `Проверен ${analysisDate(entry.lastAnalyzedAt)}`
-                      : 'Ранее не проверялся'}
+                  <span
+                    className={
+                      entry.alreadyAnalyzed
+                        ? `analysis-status ${analysisStatusTone(entry.lastAnalysisStatus)}`
+                        : 'analysis-status'
+                    }
+                  >
+                    {priorAnalysisText(entry)}
                   </span>
                 </div>
               </label>

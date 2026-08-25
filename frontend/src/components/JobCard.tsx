@@ -62,7 +62,7 @@ export function JobCard({
       {job.error && <p className="job-error">{job.error}</p>}
       {(((canStop || canResume || canRetry || canRecalculate) && onAction) || onViewLogs || onViewSummary || onDelete) && (
         <div className="job-actions">
-          <span>{job.stage}</span>
+          <span className="job-actions-status">{job.stage}</span>
           <div className="job-action-buttons">
             {canStop && onAction && (
               <button type="button" className="text-button danger" onClick={(event) => {
@@ -113,10 +113,14 @@ export function JobCard({
               </button>
             )}
             {onDelete && (
-              <button type="button" className="text-button danger" onClick={(event) => {
-                event.stopPropagation()
-                onDelete()
-              }}>
+              <button
+                type="button"
+                className="text-button danger job-delete-action"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onDelete()
+                }}
+              >
                 <Trash2 size={15} /> Удалить
               </button>
             )}

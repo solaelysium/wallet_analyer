@@ -40,6 +40,8 @@ interface RawPreview {
     source_index: string | null
     already_analyzed: boolean
     last_analyzed_at: string | null
+    last_analysis_status?: string | null
+    last_analysis_error?: string | null
   }[]
   issues: {
     kind: string
@@ -350,6 +352,8 @@ export function normalizePreview(raw: RawPreview): WalletPreview {
       sourceIndex: entry.source_index,
       alreadyAnalyzed: entry.already_analyzed,
       lastAnalyzedAt: entry.last_analyzed_at,
+      lastAnalysisStatus: entry.last_analysis_status ?? null,
+      lastAnalysisError: entry.last_analysis_error ?? null,
     })),
     issues: raw.issues.map((issue) => ({
       ...issue,

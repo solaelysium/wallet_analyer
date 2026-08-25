@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from app.models import ApiKey, Chain, Wallet, WalletImport, WalletImportMember
+from app.models import ApiKey, Chain, Job, JobItem, Wallet, WalletImport, WalletImportMember
 
 
 ADDRESS_A = "0x0000000000000000000000000000000000000001"
@@ -104,6 +104,8 @@ def test_preview_marks_analyzed_wallet_and_confirmation_can_exclude_it(
     )
     assert existing["already_analyzed"] is True
     assert existing["last_analyzed_at"].startswith("2026-07-30T12:30")
+    assert existing["last_analysis_status"] == "completed"
+    assert existing["last_analysis_error"] is None
 
     confirmed = client.post(
         "/api/imports/confirm",
@@ -127,6 +129,43 @@ def test_preview_marks_analyzed_wallet_and_confirmation_can_exclude_it(
         )
         wallet = session.get(Wallet, member.wallet_id)
         assert wallet.address == ADDRESS_B
+
+
+def test_preview_includes_last_job_item_status(app_client) -> None:
+    client, database = app_client
+    finished_at = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
+    with database.session() as session:
+        chain = session.scalar(select(Chain).where(Chain.slug == "ethereum"))
+        wallet = Wallet(
+            chain_id=chain.id,
+            address=ADDRESS_A,
+            checksum_address=ADDRESS_A,
+        )
+        session.add(wallet)
+        session.flush()
+        job = Job(kind="collection", state="completed_with_errors", progress_total=1)
+        session.add(job)
+        session.flush()
+        session.add(
+            JobItem(
+                job_id=job.id,
+                wallet_id=wallet.id,
+                state="skipped",
+                error="Более 25 000 транзакций (25001)",
+                finished_at=finished_at,
+            )
+        )
+
+    preview = client.post(
+        "/api/imports/preview",
+        data={"manual_text": ADDRESS_A, "chain": "ethereum"},
+    )
+    assert preview.status_code == 200
+    entry = preview.json()["entries"][0]
+    assert entry["already_analyzed"] is True
+    assert entry["last_analysis_status"] == "skipped"
+    assert "25 000" in entry["last_analysis_error"]
+    assert entry["last_analyzed_at"].startswith("2026-07-30T15:00")
 
 
 def test_tabular_import_rejects_extra_columns(app_client) -> None:

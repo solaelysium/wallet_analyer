@@ -47,6 +47,8 @@ describe('backend API contract adapters', () => {
           source_index: 'a-1',
           already_analyzed: true,
           last_analyzed_at: '2026-07-29T20:00:00+00:00',
+          last_analysis_status: 'skipped',
+          last_analysis_error: 'too many',
         }],
         issues: [{
           kind: 'duplicate',
@@ -74,6 +76,8 @@ describe('backend API contract adapters', () => {
       sourceIndex: 'a-1',
       alreadyAnalyzed: true,
       lastAnalyzedAt: '2026-07-29T20:00:00+00:00',
+      lastAnalysisStatus: 'skipped',
+      lastAnalysisError: 'too many',
     })
     expect(preview.issues[0].detail).toContain('First seen')
   })

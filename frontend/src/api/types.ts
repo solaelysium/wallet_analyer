@@ -15,6 +15,8 @@ export interface PreviewEntry {
   sourceIndex: string | null
   alreadyAnalyzed: boolean
   lastAnalyzedAt: string | null
+  lastAnalysisStatus: string | null
+  lastAnalysisError: string | null
 }
 
 export interface ImportIssue {

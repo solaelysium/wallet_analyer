@@ -34,6 +34,8 @@ class PreviewEntry(BaseModel):
     source_index: str | None = None
     already_analyzed: bool = False
     last_analyzed_at: datetime | None = None
+    last_analysis_status: str | None = None
+    last_analysis_error: str | None = None
 
 
 class ImportPreview(BaseModel):
@@ -242,11 +244,43 @@ async def preview_import(
             )
         ).all()
     }
+    wallet_ids = [wallet.id for wallet in known_wallets.values()]
+    latest_items: dict[int, JobItem] = {}
+    if wallet_ids:
+        for item in session.scalars(
+            select(JobItem)
+            .where(JobItem.wallet_id.in_(wallet_ids))
+            .order_by(JobItem.id.desc())
+        ).all():
+            if item.wallet_id not in latest_items:
+                latest_items[item.wallet_id] = item
+
+    terminal_states = {
+        "completed",
+        "skipped",
+        "failed",
+        "cancelled",
+    }
     for entry in entries:
         wallet = known_wallets.get(entry.address)
-        if wallet and wallet.last_collected_at is not None:
+        if wallet is None:
+            continue
+        item = latest_items.get(wallet.id)
+        if item is not None and item.state in terminal_states:
+            entry.already_analyzed = True
+            entry.last_analysis_status = item.state
+            entry.last_analysis_error = (item.error or "").strip() or None
+            entry.last_analyzed_at = (
+                item.finished_at
+                or item.started_at
+                or item.created_at
+                or wallet.last_collected_at
+            )
+        elif wallet.last_collected_at is not None:
             entry.already_analyzed = True
             entry.last_analyzed_at = wallet.last_collected_at
+            entry.last_analysis_status = "completed"
+            entry.last_analysis_error = None
 
     payload = json.dumps(
         {

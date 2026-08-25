@@ -45,6 +45,8 @@ export function FeatureTable({
   const [anchor, setAnchor] = useState<{ row: number; column: number } | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false)
+  const [toast, setToast] = useState<string | null>(null)
+  const toastTimerRef = useRef<number | null>(null)
 
   const columns = useMemo<ColumnDef<FeatureRow>[]>(
     () =>
@@ -78,9 +80,23 @@ export function FeatureTable({
     estimateSize: () => 43,
     overscan: 8,
   })
+  // Fixed track sizes so sticky address stays within a full-width row, not the viewport.
+  const ADDRESS_COL_WIDTH = 250
+  const FEATURE_COL_WIDTH = 140
+  const gridMinWidth = visibleColumns.reduce(
+    (sum, column) => sum + (column.id === 'address' ? ADDRESS_COL_WIDTH : FEATURE_COL_WIDTH),
+    0,
+  )
   const gridTemplate = visibleColumns
-    .map((column) => (column.id === 'address' ? 'minmax(250px, 1.8fr)' : 'minmax(140px, 1fr)'))
+    .map((column) => (
+      column.id === 'address' ? `${ADDRESS_COL_WIDTH}px` : `${FEATURE_COL_WIDTH}px`
+    ))
     .join(' ')
+  const gridStyle = {
+    gridTemplateColumns: gridTemplate,
+    width: `${gridMinWidth}px`,
+    minWidth: `${gridMinWidth}px`,
+  }
   const selectedWalletIds = Array.from(new Set(
     Array.from(selected)
       .map((key) => Number(key.split(':')[0]))
@@ -92,6 +108,26 @@ export function FeatureTable({
     setSelected(new Set())
     setAnchor(null)
   }, [page, rows])
+
+  useEffect(() => () => {
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+  }, [])
+
+  function showToast(message: string) {
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+    setToast(message)
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null)
+      toastTimerRef.current = null
+    }, 2200)
+  }
+
+  async function copyAddress(address: string) {
+    const value = address.trim()
+    if (!value) return
+    await navigator.clipboard.writeText(value)
+    showToast('Адрес скопирован')
+  }
 
   function selectCell(rowIndex: number, columnIndex: number, extend: boolean) {
     if (extend && anchor) {
@@ -113,15 +149,53 @@ export function FeatureTable({
   }
 
   async function copySelection() {
-    const values = Array.from(selected)
-      .sort()
-      .map((key) => {
-        const [rowIndex, columnIndex] = key.split(':').map(Number)
-        const column = visibleColumns[columnIndex]
-        return column ? String(rows[rowIndex]?.[column.id] ?? '') : ''
-      })
-    await navigator.clipboard.writeText(values.join('\t'))
+    if (!selected.size) return
+    const cells = Array.from(selected).map((key) => {
+      const [rowIndex, columnIndex] = key.split(':').map(Number)
+      return { rowIndex, columnIndex }
+    })
+    const minRow = Math.min(...cells.map((cell) => cell.rowIndex))
+    const maxRow = Math.max(...cells.map((cell) => cell.rowIndex))
+    const minCol = Math.min(...cells.map((cell) => cell.columnIndex))
+    const maxCol = Math.max(...cells.map((cell) => cell.columnIndex))
+    const lines: string[] = []
+    for (let row = minRow; row <= maxRow; row += 1) {
+      const parts: string[] = []
+      for (let col = minCol; col <= maxCol; col += 1) {
+        if (!selected.has(`${row}:${col}`)) {
+          parts.push('')
+          continue
+        }
+        const column = visibleColumns[col]
+        parts.push(column ? String(rows[row]?.[column.id] ?? '') : '')
+      }
+      lines.push(parts.join('\t'))
+    }
+    await navigator.clipboard.writeText(lines.join('\n'))
+    showToast(selected.size === 1 ? 'Скопировано' : `Скопировано ячеек: ${selected.size}`)
   }
+
+  const copySelectionRef = useRef(copySelection)
+  copySelectionRef.current = copySelection
+  const selectedCountRef = useRef(selected.size)
+  selectedCountRef.current = selected.size
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return
+      // Physical C key — works with EN/RU layouts alike.
+      if (event.code !== 'KeyC') return
+      if (!selectedCountRef.current) return
+      const target = event.target
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) {
+        return
+      }
+      event.preventDefault()
+      void copySelectionRef.current()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   async function copyColumn(columnId: string) {
     await navigator.clipboard.writeText(rows.map((row) => String(row[columnId] ?? '')).join('\n'))
@@ -196,7 +270,7 @@ export function FeatureTable({
       </div>
       <div className="data-table" role="table" aria-rowcount={total}>
         <div className="table-scroll" ref={containerRef}>
-          <div className="table-header table-grid" role="row" style={{ gridTemplateColumns: gridTemplate }}>
+          <div className="table-header table-grid" role="row" style={gridStyle}>
             {table.getHeaderGroups()[0]?.headers.map((header) => (
               <div className={header.column.id === 'address' ? 'sticky-column' : ''} role="columnheader" key={header.id}>
                 <GripVertical size={13} aria-hidden="true" />
@@ -222,7 +296,14 @@ export function FeatureTable({
               </div>
             ))}
           </div>
-          <div style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative', minWidth: '900px' }}>
+          <div
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              position: 'relative',
+              width: `${gridMinWidth}px`,
+              minWidth: `${gridMinWidth}px`,
+            }}
+          >
             {virtualizer.getVirtualItems().map((virtualRow) => {
               const row = table.getRowModel().rows[virtualRow.index]
               return (
@@ -231,21 +312,28 @@ export function FeatureTable({
                   role="row"
                   key={row.id}
                   style={{
-                    gridTemplateColumns: gridTemplate,
-                    transform: `translateY(${virtualRow.start}px)`,
+                    ...gridStyle,
+                    top: `${virtualRow.start}px`,
                   }}
                 >
                   {row.getVisibleCells().map((cell, columnIndex) => {
                     const key = `${virtualRow.index}:${columnIndex}`
+                    const isAddress = cell.column.id === 'address'
+                    const cellValue = String(cell.getValue() ?? '')
                     return (
                       <button
-                        className={`table-cell${cell.column.id === 'address' ? ' sticky-column address-cell' : ''}${selected.has(key) ? ' selected' : ''}`}
+                        className={`table-cell${isAddress ? ' sticky-column address-cell' : ''}${selected.has(key) ? ' selected' : ''}`}
                         role="cell"
                         type="button"
                         key={cell.id}
-                        title={String(cell.getValue() ?? '')}
-                        onClick={(event) => selectCell(virtualRow.index, columnIndex, event.shiftKey)}
-                        onDoubleClick={() => void navigator.clipboard.writeText(String(cell.getValue() ?? ''))}
+                        title={isAddress ? 'Нажмите, чтобы скопировать адрес' : cellValue}
+                        onClick={(event) => {
+                          selectCell(virtualRow.index, columnIndex, event.shiftKey)
+                          if (isAddress && !event.shiftKey) void copyAddress(cellValue)
+                        }}
+                        onDoubleClick={() => {
+                          if (!isAddress) void navigator.clipboard.writeText(cellValue)
+                        }}
                       >
                         {flexRender(cell.column.columnDef.cell, cell.getContext())}
                       </button>
@@ -289,6 +377,11 @@ export function FeatureTable({
         onConfirm={() => void deleteSelectedWallets()}
         onClose={() => setDeleteConfirmationOpen(false)}
       />
+      {toast && (
+        <div className="copy-toast" role="status" aria-live="polite">
+          {toast}
+        </div>
+      )}
     </>
   )
 }

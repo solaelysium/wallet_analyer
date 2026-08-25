@@ -357,31 +357,42 @@ class CollectionJobManager:
             raise ValueError("Адрес относится к смарт-контракту, а не к кошельку")
         balance_wei = self.providers.rpc.balance_wei(address)
 
+        collected = 0
         remaining = MAX_WALLET_EVENTS
-        self._set_stage(item_id, "normal_transactions")
-        normal_rows = self.providers.explorer.normal_transactions(
-            address,
-            lambda: self._cancel_check(job_id),
-            max_rows=remaining,
-        )
-        remaining -= len(normal_rows)
+        try:
+            self._set_stage(item_id, "normal_transactions")
+            normal_rows = self.providers.explorer.normal_transactions(
+                address,
+                lambda: self._cancel_check(job_id),
+                max_rows=remaining,
+            )
+            collected = len(normal_rows)
+            remaining = MAX_WALLET_EVENTS - collected
 
-        self._cancel_check(job_id)
-        self._set_stage(item_id, "internal_transactions")
-        internal_rows = self.providers.explorer.internal_transactions(
-            address,
-            lambda: self._cancel_check(job_id),
-            max_rows=remaining,
-        )
-        remaining -= len(internal_rows)
+            self._cancel_check(job_id)
+            self._set_stage(item_id, "internal_transactions")
+            internal_rows = self.providers.explorer.internal_transactions(
+                address,
+                lambda: self._cancel_check(job_id),
+                max_rows=remaining,
+            )
+            collected += len(internal_rows)
+            remaining = MAX_WALLET_EVENTS - collected
 
-        self._cancel_check(job_id)
-        self._set_stage(item_id, "token_transfers")
-        transfer_rows = self.providers.explorer.token_transfers(
-            address,
-            lambda: self._cancel_check(job_id),
-            max_rows=remaining,
-        )
+            self._cancel_check(job_id)
+            self._set_stage(item_id, "token_transfers")
+            transfer_rows = self.providers.explorer.token_transfers(
+                address,
+                lambda: self._cancel_check(job_id),
+                max_rows=remaining,
+            )
+            collected += len(transfer_rows)
+        except TooManyTransactionsError as exc:
+            # Provider count is for the overflowing stream only; include prior phases.
+            at_least = collected + max(int(exc.count), 1)
+            if at_least <= MAX_WALLET_EVENTS:
+                at_least = MAX_WALLET_EVENTS + 1
+            raise TooManyTransactionsError(at_least) from exc
 
         self._persist_normals(wallet_id, normal_rows)
         self._persist_internals(wallet_id, internal_rows)

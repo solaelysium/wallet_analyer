@@ -8,7 +8,7 @@ from app.config import Settings
 from app.database import Database
 from app.jobs import CollectionJobManager
 from app.key_pool import KeyPool, RateLimitedError
-from app.models import Chain, Job, JobItem, Token, Wallet
+from app.models import ApiKey, Chain, Job, JobItem, Token, Wallet
 from app.providers import ProviderBundle
 from conftest import FakeExplorer, FakePrices, FakeRpc
 
@@ -17,6 +17,34 @@ def test_settings_ignore_environment_provider_keys(monkeypatch) -> None:
     monkeypatch.setenv("INFURA_API_KEYS", "first, second")
     settings = Settings(_env_file=None)
     assert settings.infura_api_keys == []
+
+
+def test_key_pool_persists_last_used_at(app_client) -> None:
+    client, database = app_client
+    created = client.post(
+        "/api/api-keys",
+        json={
+            "service": "etherscan",
+            "label": "primary",
+            "value": "etherscan-test-key-value",
+        },
+    )
+    assert created.status_code == 201
+    key_id = created.json()["id"]
+    listed = client.get("/api/api-keys").json()
+    assert listed[0]["last_used_at"] is None
+
+    pool = client.app.state.providers.key_pool
+    pool.usage_persist_interval = 0
+    assert pool.call("etherscan", lambda key: key) == "etherscan-test-key-value"
+
+    listed = client.get("/api/api-keys").json()
+    assert listed[0]["id"] == key_id
+    assert listed[0]["last_used_at"] is not None
+    with database.session() as session:
+        row = session.get(ApiKey, key_id)
+        assert row is not None
+        assert row.last_used_at is not None
 
 
 def test_key_pool_rotates_after_rate_limit(monkeypatch) -> None:

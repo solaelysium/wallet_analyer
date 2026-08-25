@@ -538,6 +538,7 @@ class ProviderBundle:
         for row in rows:
             keys.setdefault(row.service, []).append(
                 {
+                    "id": row.id,
                     "value": row.value,
                     "label": row.label,
                     "enabled": row.enabled,

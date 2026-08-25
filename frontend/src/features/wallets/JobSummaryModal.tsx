@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useEffect, useMemo, useState } from 'react'
 import { getJobSummary } from '../../api/client'
 import type { Job, JobSummary, JobSummaryWallet } from '../../api/types'
 import { Modal } from '../../components/Modal'
@@ -8,10 +9,12 @@ interface JobSummaryModalProps {
   onClose: () => void
 }
 
-const metricRows: {
-  key: keyof Pick<JobSummary, 'completed' | 'skipped' | 'failed' | 'cancelled' | 'running' | 'queued'>
-  label: string
-}[] = [
+type StatusFilter = 'all' | keyof Pick<
+  JobSummary,
+  'completed' | 'skipped' | 'failed' | 'cancelled' | 'running' | 'queued'
+>
+
+const metricRows: { key: Exclude<StatusFilter, 'all'>; label: string }[] = [
   { key: 'completed', label: 'Собрано' },
   { key: 'skipped', label: 'Пропущено' },
   { key: 'failed', label: 'Ошибки' },
@@ -42,13 +45,33 @@ function txLabel(count: number | null) {
   return `${count.toLocaleString('ru-RU')} транз.`
 }
 
+function filterLabel(filter: StatusFilter) {
+  if (filter === 'all') return 'Все'
+  return metricRows.find((row) => row.key === filter)?.label ?? filter
+}
+
 export function JobSummaryModal({ job, onClose }: JobSummaryModalProps) {
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const summary = useQuery({
     queryKey: ['job-summary', job?.id],
     queryFn: () => getJobSummary(job!.id),
     enabled: job !== null,
     refetchInterval: job && ['queued', 'running', 'cancelling'].includes(job.status) ? 3000 : false,
   })
+
+  useEffect(() => {
+    setStatusFilter('all')
+  }, [job?.id])
+
+  const filteredWallets = useMemo(() => {
+    const wallets = summary.data?.wallets ?? []
+    if (statusFilter === 'all') return wallets
+    return wallets.filter((wallet) => wallet.state === statusFilter)
+  }, [statusFilter, summary.data?.wallets])
+
+  function selectFilter(next: StatusFilter) {
+    setStatusFilter((current) => (current === next && next !== 'all' ? 'all' : next))
+  }
 
   return (
     <Modal
@@ -64,14 +87,45 @@ export function JobSummaryModal({ job, onClose }: JobSummaryModalProps) {
           <p className="job-summary-total">
             Всего кошельков: <strong>{summary.data.total.toLocaleString('ru-RU')}</strong>
           </p>
-          <dl className="job-summary-grid">
+          <div className="job-summary-grid">
             {metricRows.map(({ key, label }) => (
-              <div key={key}>
-                <dt>{label}</dt>
-                <dd>{summary.data[key].toLocaleString('ru-RU')}</dd>
-              </div>
+              <button
+                type="button"
+                key={key}
+                className={`job-summary-metric${statusFilter === key ? ' active' : ''}`}
+                aria-pressed={statusFilter === key}
+                onClick={() => selectFilter(key)}
+              >
+                <span className="job-summary-metric-label">{label}</span>
+                <span className="job-summary-metric-value">{summary.data[key].toLocaleString('ru-RU')}</span>
+              </button>
             ))}
-          </dl>
+          </div>
+          <div className="job-summary-filters" role="toolbar" aria-label="Фильтр по статусу">
+            <button
+              type="button"
+              className={statusFilter === 'all' ? 'active' : ''}
+              aria-pressed={statusFilter === 'all'}
+              onClick={() => setStatusFilter('all')}
+            >
+              Все ({summary.data.total.toLocaleString('ru-RU')})
+            </button>
+            {metricRows.map(({ key, label }) => {
+              const count = summary.data[key]
+              if (count === 0) return null
+              return (
+                <button
+                  type="button"
+                  key={key}
+                  className={statusFilter === key ? 'active' : ''}
+                  aria-pressed={statusFilter === key}
+                  onClick={() => selectFilter(key)}
+                >
+                  {label} ({count.toLocaleString('ru-RU')})
+                </button>
+              )
+            })}
+          </div>
           <div className="job-summary-list-panel">
             <div className="job-summary-list-head">
               <span>Кошелёк</span>
@@ -82,7 +136,10 @@ export function JobSummaryModal({ job, onClose }: JobSummaryModalProps) {
               {summary.data.wallets.length === 0 && (
                 <p className="muted">В этом пакете пока нет кошельков.</p>
               )}
-              {summary.data.wallets.map((wallet) => {
+              {summary.data.wallets.length > 0 && filteredWallets.length === 0 && (
+                <p className="muted">Нет кошельков со статусом «{filterLabel(statusFilter)}».</p>
+              )}
+              {filteredWallets.map((wallet) => {
                 const status = statusMeta(wallet.state)
                 const reason = reasonFor(wallet)
                 return (
