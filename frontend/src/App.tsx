@@ -8,9 +8,6 @@ const WalletsPage = lazy(() =>
 const FeaturesPage = lazy(() =>
   import('./features/features/FeaturesPage').then((module) => ({ default: module.FeaturesPage })),
 )
-const ClusteringPage = lazy(() =>
-  import('./features/clustering/ClusteringPage').then((module) => ({ default: module.ClusteringPage })),
-)
 const LogsPage = lazy(() =>
   import('./features/logs/LogsPage').then((module) => ({ default: module.LogsPage })),
 )
@@ -25,7 +22,6 @@ function App() {
       <Suspense fallback={<LoadingState label="Загрузка рабочей области" />}>
         {page === 'wallets' && <WalletsPage />}
         {page === 'features' && <FeaturesPage />}
-        {page === 'clustering' && <ClusteringPage />}
         {page === 'logs' && <LogsPage />}
         {page === 'settings' && <SettingsPage />}
       </Suspense>

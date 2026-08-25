@@ -1,4 +1,4 @@
-import { Boxes, Database, ScrollText, Settings, WalletCards } from 'lucide-react'
+import { Database, ScrollText, Settings, WalletCards } from 'lucide-react'
 import type { ReactNode } from 'react'
 
 export type PageId = 'wallets' | 'features' | 'clustering' | 'logs' | 'settings'
@@ -6,7 +6,6 @@ export type PageId = 'wallets' | 'features' | 'clustering' | 'logs' | 'settings'
 const pages = [
   { id: 'wallets' as const, label: 'Кошельки', icon: WalletCards },
   { id: 'features' as const, label: 'Признаки', icon: Database },
-  { id: 'clustering' as const, label: 'Кластеризация', icon: Boxes },
   { id: 'logs' as const, label: 'Журнал', icon: ScrollText },
   { id: 'settings' as const, label: 'Настройки', icon: Settings },
 ]

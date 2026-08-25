@@ -34,7 +34,7 @@ describe('application navigation', () => {
     )
   })
 
-  it('shows all five work pages and changes the active page', async () => {
+  it('shows available work pages and changes the active page', async () => {
     const user = userEvent.setup()
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(
@@ -43,12 +43,11 @@ describe('application navigation', () => {
       </QueryClientProvider>,
     )
 
-    expect(screen.getByRole('navigation').querySelectorAll('button')).toHaveLength(5)
+    expect(screen.getByRole('navigation').querySelectorAll('button')).toHaveLength(4)
+    expect(screen.queryByRole('button', { name: 'Кластеризация' })).not.toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: 'Кошельки' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Признаки' }))
     expect(await screen.findByRole('heading', { name: 'Признаки' })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Кластеризация' }))
-    expect(await screen.findByRole('heading', { name: 'Кластеризация' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Журнал' }))
     expect(await screen.findByRole('heading', { name: 'Журнал событий' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Настройки' }))
