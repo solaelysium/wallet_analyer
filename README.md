@@ -73,6 +73,8 @@ npm run dev
 
 Vite: [http://localhost:5173](http://localhost:5173).
 
+Подробнее: [backend/README.md](backend/README.md), [frontend/README.md](frontend/README.md).
+
 ## Тесты
 
 ```bash
