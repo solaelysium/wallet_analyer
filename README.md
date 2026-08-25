@@ -1,44 +1,59 @@
 # Wallet Analyzer
 
-Local web application for collecting Ethereum wallet features and exploring
-behavioral clusters.
+Локальное веб-приложение для сбора транзакций Ethereum-кошельков и расчёта поведенческих признаков.
 
-## Capabilities
+Интерфейс: **Кошельки → Признаки → Журнал → Настройки**. Кластеризация пока в процессе доработки и скрыта из UI.
 
-- Aggregate wallet addresses from CSV, XLSX, TXT, and manual input.
-- Preview, validate, and deduplicate addresses before creating an analysis job.
-- Collect resumable wallet features with live progress and cancellation.
-- Browse, filter, copy, and export feature data.
-- Run PCA or UMAP with HDBSCAN or KMeans.
-- Export feature tables, clustering assignments, and cluster plots.
+## Возможности
 
-## Input formats
+- Импорт адресов из CSV, XLSX, TXT и ручного ввода с предпросмотром, валидацией и дедупликацией.
+- Сбор данных через Etherscan, Infura и CoinGecko: обычные/внутренние транзакции и ERC-20 переводы.
+- Двухфазный пайплайн: сначала коллекция, затем расчёт признаков (`wallet_features.v4`).
+- Пропуск кошельков с более чем 25 000 событий.
+- Таблица признаков: фильтры, сортировка, закреплённый столбец адреса, экспорт CSV/XLSX.
+- Кластеризация (в процессе): PCA или UMAP, затем HDBSCAN или KMeans; пока недоступна в интерфейсе.
+- Ключи провайдеров, лимиты и воркеры настраиваются в UI, без `.env`.
 
-- CSV/XLSX: an index column followed by `wallet_address`.
-- TXT: one Ethereum address per non-empty line.
-- Manual input: one Ethereum address per line.
+## Форматы входа
 
-All selected files and manual text are merged into one preview. Invalid and
-duplicate values are shown before confirmation.
+| Источник | Формат |
+| --- | --- |
+| CSV / XLSX | только столбцы `index` и `wallet_address` |
+| TXT / ручной ввод | один Ethereum-адрес на непустую строку |
 
-## Docker start
+Все источники сливаются в один предпросмотр. Некорректные строки, дубликаты и уже проверенные адреса видны до запуска пакета.
 
-Start the application without an environment file:
+## Стек
+
+- Backend: FastAPI, SQLAlchemy, SQLite (несколько файлов через `ATTACH`)
+- Frontend: React, Vite, TanStack Table / Query
+- ML: scikit-learn, UMAP, HDBSCAN
+
+## Запуск
 
 ```bash
 docker compose up --build
 ```
 
-Open `http://localhost:8080`. Backend health is available at
-`http://localhost:8000/health`. Add provider keys and change runtime settings
-from the Settings page.
+- UI: [http://localhost:8080](http://localhost:8080)
+- API health: [http://localhost:8000/health](http://localhost:8000/health)
 
-Application data is split across `keys.sqlite3`, `wallets.sqlite3`,
-`events.sqlite3`, `tokens.sqlite3`, `analytics.sqlite3`, and `logs.sqlite3`
-under `data/`. An existing `data/wallet_analyzer.sqlite3` is imported once and
-left unchanged as a backup.
+После старта добавьте ключи Etherscan, Infura и CoinGecko на странице **Настройки**.
 
-## Development
+Данные лежат в `data/`:
+
+| Файл | Содержимое |
+| --- | --- |
+| `keys.sqlite3` | API-ключи и runtime-настройки |
+| `wallets.sqlite3` | кошельки и пакеты импорта |
+| `events.sqlite3` | транзакции и переводы |
+| `tokens.sqlite3` | токены и цены |
+| `analytics.sqlite3` | признаки и кластеры |
+| `logs.sqlite3` | журнал |
+
+Существующий `data/wallet_analyzer.sqlite3` импортируется один раз и остаётся как бэкап.
+
+## Разработка
 
 Backend:
 
@@ -56,9 +71,9 @@ npm install
 npm run dev
 ```
 
-The Vite development server is available at `http://localhost:5173`.
+Vite: [http://localhost:5173](http://localhost:5173).
 
-## Tests
+## Тесты
 
 ```bash
 .venv/Scripts/python -m pytest backend/tests
